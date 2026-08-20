@@ -1,0 +1,90 @@
+report:
+  # Called by the dashboard card once a run finishes. It is a service rather
+  # than a websocket command so that a run can also be reported from a script,
+  # an automation, or by hand from Developer Tools when testing.
+  fields:
+    client_id:
+      required: true
+      example: "8f14e45f-ea3b-4f2e-9c1d-2a7b1f0c9e33"
+      selector:
+        text:
+    client_name:
+      required: true
+      example: "Pixel 9 Pro"
+      selector:
+        text:
+    platform:
+      example: "android_app"
+      selector:
+        select:
+          options:
+            - browser
+            - android_app
+            - ios_app
+            - unknown
+    origin:
+      example: "https://ha.example.net"
+      selector:
+        text:
+    path:
+      example: "external"
+      selector:
+        select:
+          options:
+            - internal
+            - external
+            - unknown
+    user:
+      example: "John"
+      selector:
+        text:
+    user_agent:
+      selector:
+        text:
+    latency_samples_ms:
+      example: "[8.1, 7.4, 9.6]"
+      selector:
+        object:
+    http_latency_ms:
+      example: 12.4
+      selector:
+        number:
+          min: 0
+          max: 60000
+          mode: box
+          unit_of_measurement: ms
+    download_bytes:
+      example: 33554432
+      selector:
+        number:
+          min: 0
+          max: 1099511627776
+          mode: box
+    download_seconds:
+      example: 4.12
+      selector:
+        number:
+          min: 0
+          max: 3600
+          mode: box
+    download_streams:
+      example: 4
+      selector:
+        number:
+          min: 1
+          max: 16
+          mode: box
+    upload_bytes:
+      example: 16777216
+      selector:
+        number:
+          min: 0
+          max: 1099511627776
+          mode: box
+    upload_seconds:
+      example: 3.87
+      selector:
+        number:
+          min: 0
+          max: 3600
+          mode: box

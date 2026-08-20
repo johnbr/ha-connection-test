@@ -1,0 +1,5 @@
+{
+  "name": "Connection Test",
+  "render_readme": true,
+  "homeassistant": "2025.7.0"
+}

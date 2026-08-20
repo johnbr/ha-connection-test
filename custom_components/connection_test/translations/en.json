@@ -1,0 +1,93 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connection Test",
+        "description": "Adds the test endpoints, the dashboard card and the result sensors. There is nothing to configure here — payload sizes and how a device names itself are options on the card, because they describe the client being measured rather than the server."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Connection Test is already set up."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "latency": {
+        "name": "Latency"
+      },
+      "download": {
+        "name": "Download"
+      },
+      "upload": {
+        "name": "Upload"
+      },
+      "last_run": {
+        "name": "Last run"
+      }
+    }
+  },
+  "services": {
+    "report": {
+      "name": "Report result",
+      "description": "Records the result of a connection test run by a client. The card calls this automatically when a run finishes.",
+      "fields": {
+        "client_id": {
+          "name": "Client ID",
+          "description": "Stable identifier for the device that ran the test. Results are keyed on this, so renaming a device updates its row instead of creating a second one."
+        },
+        "client_name": {
+          "name": "Client name",
+          "description": "Friendly name for the device, shown on the dashboard."
+        },
+        "platform": {
+          "name": "Platform",
+          "description": "Which kind of client ran the test."
+        },
+        "origin": {
+          "name": "Origin",
+          "description": "The URL the client reached Home Assistant on. Which one was used changes what the result means."
+        },
+        "path": {
+          "name": "Path",
+          "description": "Whether the client reached Home Assistant over the local network or from outside it."
+        },
+        "user": {
+          "name": "User",
+          "description": "The Home Assistant user logged in on that client."
+        },
+        "user_agent": {
+          "name": "User agent",
+          "description": "The client's browser user agent string."
+        },
+        "latency_samples_ms": {
+          "name": "Latency samples",
+          "description": "Raw round-trip times in milliseconds. The minimum, average, 95th percentile and jitter are derived from these."
+        },
+        "http_latency_ms": {
+          "name": "HTTP latency",
+          "description": "Round-trip time over plain HTTP, for comparison with the websocket figure."
+        },
+        "download_bytes": {
+          "name": "Download bytes",
+          "description": "How many bytes were downloaded."
+        },
+        "download_seconds": {
+          "name": "Download duration",
+          "description": "How long the download took, measured by the client."
+        },
+        "download_streams": {
+          "name": "Download streams",
+          "description": "How many parallel connections the download used."
+        },
+        "upload_bytes": {
+          "name": "Upload bytes",
+          "description": "How many bytes were uploaded."
+        },
+        "upload_seconds": {
+          "name": "Upload duration",
+          "description": "How long the upload took, measured by the client."
+        }
+      }
+    }
+  }
+}
