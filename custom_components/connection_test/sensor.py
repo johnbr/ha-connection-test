@@ -77,10 +77,20 @@ def _upload_attrs(run: dict[str, Any], _: ConnectionTestRuntime) -> dict[str, An
 
 
 def _last_run_attrs(run: dict[str, Any], runtime: ConnectionTestRuntime) -> dict[str, Any]:
+    network = run.get("network") or {}
     return {
         "latency_ms": (run.get("latency") or {}).get("avg"),
         "download_mbps": (run.get("download") or {}).get("mbps"),
         "upload_mbps": (run.get("upload") or {}).get("mbps"),
+        # The evidence behind the `connection` verdict, kept so a surprising
+        # verdict can be argued with. `reported_type` empty means the browser
+        # does not implement navigator.connection.type, which most do not, and
+        # the verdict then rests on the address alone.
+        "network_reported_type": network.get("reported_type"),
+        "network_effective_type": network.get("effective_type"),
+        "network_downlink_mbps": network.get("downlink_mbps"),
+        "network_rtt_ms": network.get("rtt_ms"),
+        "client_ip_source": network.get("client_ip_source"),
         "clients": runtime.clients,
     }
 
@@ -186,14 +196,27 @@ class ConnectionTestSensor(SensorEntity):
         run = self._runtime.last
         if not run:
             return {}
-        # Every sensor carries who produced its current value, because the
-        # state itself cannot say -- see the module docstring.
+        # Every sensor carries who produced its current value and how they
+        # were connected, because the state itself cannot say -- see the module
+        # docstring. Both halves matter: 40 Mbit/s is a poor LAN result and a
+        # good cellular one, so a throughput figure without its context is not
+        # interpretable.
+        device = run.get("device") or {}
+        network = run.get("network") or {}
         context = {
             "client": run.get("client"),
             "client_id": run.get("client_id"),
             "platform": run.get("platform"),
             "origin": run.get("origin"),
             "path": run.get("path"),
+            "connection": run.get("connection"),
+            "device_model": device.get("model"),
+            "device_os": device.get("os"),
+            "device_browser": device.get("browser"),
+            # The address the SERVER saw, not one the client claimed about
+            # itself -- it is what decides `path`, so it is shown next to it.
+            "client_ip": network.get("client_ip"),
+            "via_cloudflare": network.get("via_cloudflare"),
             "user": run.get("user"),
         }
         return {**context, **self.entity_description.attrs_fn(run, self._runtime)}

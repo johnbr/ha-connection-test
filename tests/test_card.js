@@ -36,7 +36,14 @@ const {
   isPrivateHost,
   classifyPath,
   detectPlatform,
-  defaultClientName,
+  describeDevice,
+  deviceLabel,
+  parseUserAgent,
+  parseBrowser,
+  realModel,
+  readNetwork,
+  classifyConnection,
+  connectionLabel,
   clientId,
   fmtRate,
   fmtMs,
@@ -172,10 +179,7 @@ test("classifyPath says unknown rather than guessing wrong", () => {
 
 test("detectPlatform keys on the Companion bridge, not the user agent", () => {
   assert.strictEqual(detectPlatform({ externalApp: {}, document: {} }), "android_app");
-  assert.strictEqual(
-    detectPlatform({ webkit: { messageHandlers: { externalBus: {} } }, document: {} }),
-    "ios_app"
-  );
+  assert.strictEqual(detectPlatform({ webkit: { messageHandlers: { externalBus: {} } }, document: {} }), "ios_app");
   assert.strictEqual(detectPlatform({ document: {} }), "browser");
   assert.strictEqual(detectPlatform(null), "unknown");
 });
@@ -191,32 +195,209 @@ test("detectPlatform is not fooled by a WebView reporting a browser UA", () => {
   assert.strictEqual(detectPlatform(androidWebView), "android_app");
 });
 
-test("defaultClientName names a device before anyone has", () => {
+test("detectPlatform falls back to the Companion user-agent token", () => {
+  // The bridge is installed after the page starts loading, so a run that fires
+  // early would otherwise be filed as a browser. Both apps stamp the UA.
   assert.strictEqual(
-    defaultClientName({
+    detectPlatform({
       document: {},
-      externalApp: {},
-      navigator: { userAgent: "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit" },
+      navigator: { userAgent: "Mozilla/5.0 (Linux; Android 10; K) Home Assistant/2026.8" },
     }),
-    "Pixel 9 Pro (Android app)"
+    "android_app"
   );
   assert.strictEqual(
-    defaultClientName({
+    detectPlatform({
       document: {},
-      webkit: { messageHandlers: { externalBus: {} } },
-      navigator: { userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0)" },
+      navigator: { userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0) Home Assistant/2026.8" },
     }),
-    "iPhone app"
+    "ios_app"
   );
-  assert.strictEqual(
-    defaultClientName({ document: {}, navigator: { userAgent: "Mozilla/5.0 Firefox/130.0" } }),
-    "Firefox browser"
-  );
-  // Chrome's UA also contains "Safari/"; order decides, so pin it.
-  assert.strictEqual(
-    defaultClientName({ document: {}, navigator: { userAgent: "Mozilla/5.0 Chrome/140 Safari/537.36" } }),
-    "Chrome browser"
-  );
+});
+
+/* ---------------------------------------------------------- device identity */
+
+test("realModel rejects the values Chrome's UA reduction substitutes", () => {
+  // This is the whole reason describeDevice needs Client Hints: modern Chrome
+  // on Android reports every device on earth as "K".
+  assert.strictEqual(realModel("K"), "");
+  assert.strictEqual(realModel("Android"), "");
+  assert.strictEqual(realModel(""), "");
+  assert.strictEqual(realModel("Pixel 9 Pro"), "Pixel 9 Pro");
+  // WebViews append the build fingerprint.
+  assert.strictEqual(realModel("Pixel Tablet Build/AP4A.241205.013"), "Pixel Tablet");
+});
+
+test("parseUserAgent reads OS and form factor off the classic strings", () => {
+  const linux = parseUserAgent("Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0", {});
+  assert.strictEqual(linux.os, "Linux");
+  assert.strictEqual(linux.formFactor, "desktop");
+
+  const phone = parseUserAgent("Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) Chrome/140 Mobile Safari", {});
+  assert.deepStrictEqual([phone.os, phone.model, phone.formFactor], ["Android 15", "Pixel 9 Pro", "phone"]);
+
+  // Chrome omits the "Mobile" token on tablets. That is the only signal in the
+  // string, so it decides.
+  const tablet = parseUserAgent("Mozilla/5.0 (Linux; Android 15; Pixel Tablet) Chrome/140 Safari", {});
+  assert.strictEqual(tablet.formFactor, "tablet");
+
+  const iphone = parseUserAgent("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", {});
+  assert.deepStrictEqual([iphone.model, iphone.formFactor], ["iPhone", "phone"]);
+});
+
+test("parseUserAgent separates an iPad in desktop mode from a real Mac", () => {
+  // iPadOS Safari requests desktop pages and calls itself a Macintosh. Only
+  // the touch-point count tells them apart.
+  const ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Version/17.0 Safari/605.1.15";
+  assert.strictEqual(parseUserAgent(ua, { navigator: { maxTouchPoints: 0 } }).model, "Mac");
+  assert.strictEqual(parseUserAgent(ua, { navigator: { maxTouchPoints: 5 } }).model, "iPad");
+  assert.strictEqual(parseUserAgent(ua, { navigator: { maxTouchPoints: 5 } }).formFactor, "tablet");
+});
+
+test("parseBrowser prefers a named brand over Chromium and drops the padding", () => {
+  const brands = [
+    { brand: "Not)A;Brand", version: "24" },
+    { brand: "Chromium", version: "141" },
+    { brand: "Google Chrome", version: "141" },
+  ];
+  assert.strictEqual(parseBrowser("", { brands }), "Google Chrome 141");
+  // No hints: fall back to the string. Chrome's UA also contains "Safari/", so
+  // order decides and is pinned here.
+  assert.strictEqual(parseBrowser("Mozilla/5.0 Chrome/140.0.0.0 Safari/537.36", null), "Chrome 140");
+  assert.strictEqual(parseBrowser("Mozilla/5.0 Firefox/130.0", null), "Firefox 130");
+});
+
+test("describeDevice lets Client Hints beat a reduced user agent", () => {
+  const win = {
+    document: {},
+    navigator: {
+      // What Chrome on Android actually sends now: no model, frozen version.
+      userAgent: "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/141.0.0.0 Mobile Safari/537.36",
+      maxTouchPoints: 5,
+    },
+    screen: { width: 412, height: 915 },
+    devicePixelRatio: 2.6,
+  };
+  const hints = {
+    platform: "Android",
+    platformVersion: "16.0.0",
+    model: "Pixel 9 Pro",
+    mobile: true,
+    brands: [{ brand: "Google Chrome", version: "141" }],
+  };
+  const device = describeDevice(win, hints);
+  assert.strictEqual(device.model, "Pixel 9 Pro");
+  assert.strictEqual(device.os, "Android 16");
+  assert.strictEqual(device.form_factor, "phone");
+  assert.strictEqual(deviceLabel(device), "Pixel 9 Pro · Google Chrome 141");
+
+  // Without hints the same device is anonymous — which is exactly the bug
+  // that made two different devices both report themselves as "Chrome".
+  assert.strictEqual(describeDevice(win, null).model, "");
+});
+
+test("describeDevice never demotes a tablet to a desktop", () => {
+  // `mobile: false` means "does not want a mobile page", which is true of both
+  // tablets and desktops. It must not overrule a tablet already identified.
+  const win = {
+    document: {},
+    navigator: { userAgent: "Mozilla/5.0 (Linux; Android 10; K) Chrome/141.0.0.0 Safari/537.36" },
+  };
+  const device = describeDevice(win, {
+    platform: "Android",
+    platformVersion: "16",
+    model: "Pixel Tablet",
+    mobile: false,
+  });
+  assert.strictEqual(device.form_factor, "tablet");
+  // Hints carrying no `brands` still fall back to the user agent for the
+  // browser name, so the label stays complete.
+  assert.strictEqual(deviceLabel(device), "Pixel Tablet · Chrome 141");
+});
+
+test("deviceLabel names a desktop by its OS when there is no model", () => {
+  // The reported complaint: every machine in the house called itself "Chrome
+  // browser". A desktop has no model, so the OS has to carry the name.
+  const win = {
+    document: {},
+    navigator: { userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/141.0.0.0 Safari/537.36" },
+  };
+  const device = describeDevice(win, {
+    platform: "Linux",
+    platformVersion: "6.12.0",
+    mobile: false,
+    brands: [{ brand: "Google Chrome", version: "141" }],
+  });
+  assert.strictEqual(deviceLabel(device), "Linux desktop · Google Chrome 141");
+});
+
+test("deviceLabel puts the Companion app after the device, not instead of it", () => {
+  const win = {
+    document: {},
+    externalApp: {},
+    navigator: { userAgent: "Mozilla/5.0 (Linux; Android 10; K; wv) Chrome/141.0.0.0 Mobile Safari/537.36" },
+  };
+  const device = describeDevice(win, {
+    platform: "Android",
+    platformVersion: "16",
+    model: "Pixel 9 Pro",
+    mobile: true,
+  });
+  assert.strictEqual(device.platform, "android_app");
+  assert.strictEqual(deviceLabel(device), "Pixel 9 Pro · HA app");
+});
+
+/* ------------------------------------------------------------- the network */
+
+test("readNetwork tolerates browsers without navigator.connection", () => {
+  // Safari and Firefox implement none of it; desktop Chromium implements it
+  // without `type`. Neither may throw.
+  assert.deepStrictEqual(readNetwork({ navigator: {} }), {
+    type: "",
+    effectiveType: "",
+    downlink: null,
+    rtt: null,
+    saveData: false,
+  });
+  const chromeAndroid = readNetwork({
+    navigator: { connection: { type: "cellular", effectiveType: "4g", downlink: 10, rtt: 50, saveData: false } },
+  });
+  assert.strictEqual(chromeAndroid.type, "cellular");
+  assert.strictEqual(chromeAndroid.downlink, 10);
+});
+
+test("classifyConnection: the scope half comes from the server, the medium from the browser", () => {
+  assert.strictEqual(classifyConnection("wifi", true), "local_wifi");
+  assert.strictEqual(classifyConnection("ethernet", true), "local_wired");
+  // The common case: no browser support for `type`, but the address is known.
+  assert.strictEqual(classifyConnection("", true), "local");
+  assert.strictEqual(classifyConnection("", false), "remote");
+  // The case that prompted all this — on the house Wi-Fi, but loaded over the
+  // external URL, so the traffic really did leave the building.
+  assert.strictEqual(classifyConnection("wifi", false), "wifi");
+  // Nothing known at all.
+  assert.strictEqual(classifyConnection("", null), "unknown");
+  assert.strictEqual(classifyConnection("wifi", null), "wifi");
+});
+
+test("classifyConnection: cellular is never local", () => {
+  // A carrier NAT can hand out an RFC1918 address, so the address alone would
+  // call a phone on 5G "local". The medium overrules it.
+  assert.strictEqual(classifyConnection("cellular", true), "cellular");
+  assert.strictEqual(classifyConnection("cellular", false), "cellular");
+});
+
+test("classifyConnection ignores effectiveType by construction", () => {
+  // effectiveType grades speed, not medium: congested Wi-Fi reports "3g".
+  // It is not a parameter, and this test exists so it does not become one.
+  assert.strictEqual(classifyConnection.length, 2);
+  assert.strictEqual(classifyConnection("unknown", true), "local");
+  assert.strictEqual(classifyConnection("none", false), "remote");
+});
+
+test("connectionLabel calls out the round trip rather than hiding it", () => {
+  assert.strictEqual(connectionLabel("local_wifi"), "Local Wi-Fi");
+  assert.match(connectionLabel("wifi"), /via internet/);
+  assert.strictEqual(connectionLabel("nonsense"), "Unknown network");
 });
 
 test("clientId persists, and survives storage being unavailable", () => {

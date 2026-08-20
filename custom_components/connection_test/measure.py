@@ -13,13 +13,16 @@ authoritative for what lands in entity state.**
 
 from __future__ import annotations
 
+import ipaddress
 import math
 from collections.abc import Iterable, Mapping
 from itertools import pairwise
 from typing import Any
 
 from .const import (
+    CONNECTION_TYPES,
     DEFAULT_DOWNLOAD_BYTES,
+    MAX_DEVICE_TEXT,
     MAX_DOWNLOAD_BYTES,
     MAX_TRACKED_CLIENTS,
     MIN_DOWNLOAD_BYTES,
@@ -136,6 +139,170 @@ def _vocabulary(value: Any, allowed: frozenset[str], fallback: str) -> str:
     return text if text in allowed else fallback
 
 
+# --------------------------------------------------------------- client address
+
+# Headers a reverse proxy uses to name the client it is forwarding for, in the
+# order they should be believed. `CF-Connecting-IP` is first because Cloudflare
+# writes it itself and strips any inbound copy; `X-Real-IP` next because it is
+# what nginx sets from `$remote_addr` *after* its own real_ip processing, so it
+# already reflects any CF resolution the proxy did.
+#
+# `X-Forwarded-For` is deliberately last and only its FIRST element is read.
+# There is no position in that header that is trustworthy in general: nginx's
+# `$proxy_add_x_forwarded_for` appends the peer, so the last element is the
+# nearest hop, while Cloudflare puts the real client first and nginx then
+# appends Cloudflare. First-element is the conventional reading; the flag on the
+# result says it was a guess.
+_PROXY_IP_HEADERS = ("cf-connecting-ip", "x-real-ip", "true-client-ip")
+
+
+def is_private_address(value: Any) -> bool | None:
+    """Is this address on a local network? ``None`` when it is not an address.
+
+    The predicate is ``not is_global``: could a packet from this address have
+    been routed in off the internet? That is the question the internal/external
+    label is really asking, and one attribute answers it for every case at once
+    -- RFC1918, loopback, link-local, carrier-grade NAT space, and the
+    documentation ranges.
+
+    Reaching for ``is_private or is_loopback or is_link_local`` instead looks
+    equivalent and is not: it misses ``100.64.0.0/10``, which is precisely the
+    range a network large enough to need it would be using.
+
+    ``ipaddress`` also resolves IPv4-mapped IPv6 (``::ffff:172.31.4.57``)
+    correctly, which matters because that is what a dual-stack socket reports.
+
+    The tri-state return is load-bearing: ``None`` means "no address to judge",
+    which must not collapse into "judged, and it is public".
+    """
+    text = str(value).strip()
+    # A scope id on a link-local address (fe80::1%eth0) is not part of it.
+    text = text.split("%", 1)[0]
+    try:
+        address = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    return not address.is_global
+
+
+def observed_client_ip(headers: Mapping[str, Any], peer: Any) -> tuple[str, str]:
+    """Work out which address the client actually reached the server from.
+
+    Returns ``(address, source)`` where source names the evidence used, because
+    a diagnostic that cannot say where its number came from is not much of a
+    diagnostic.
+
+    Proxy headers are consulted ONLY when the peer is itself local -- loopback
+    for a proxy on the same host, an RFC1918 address for one on the LAN or a
+    container bridge. A request arriving straight off the internet has its own
+    address believed and its headers ignored, so a remote client cannot dress
+    itself up as local.
+
+    A client on the LAN talking to Home Assistant directly still can, since its
+    peer address is private. That is accepted: this value labels a card and
+    feeds no access-control decision anywhere. **Do not reuse it for one.** The
+    IP-ban allowlist in this house learned that lesson the expensive way.
+    """
+    peer_text = "" if peer is None else str(peer).strip()
+    peer_private = is_private_address(peer_text)
+
+    if peer_private:
+        lowered = {str(key).lower(): value for key, value in headers.items()}
+        for header in _PROXY_IP_HEADERS:
+            candidate = str(lowered.get(header) or "").strip()
+            if is_private_address(candidate) is not None:
+                return candidate, header
+        forwarded = str(lowered.get("x-forwarded-for") or "")
+        first = forwarded.split(",")[0].strip()
+        if is_private_address(first) is not None:
+            return first, "x-forwarded-for"
+
+    if peer_private is None:
+        return "", "unknown"
+    return peer_text, "peer"
+
+
+def classify_connection(
+    *,
+    network_type: Any = None,
+    remote_is_private: bool | None = None,
+) -> str:
+    """Fold "did it stay local" and "over what medium" into one word.
+
+    ``network_type`` is whatever ``navigator.connection.type`` gave the browser
+    and is frequently absent; ``remote_is_private`` is the server's own
+    observation and is not. The scope half therefore survives on its own, which
+    is the half worth having: "you are at home but this went out to the
+    internet and back" is the answer to most questions this card gets asked.
+
+    ``effectiveType`` (``4g``/``3g``/...) is deliberately NOT consulted. It
+    describes how fast a link behaves, not what it is -- a slow Wi-Fi network
+    reports ``3g`` -- so using it to guess "cellular" would invent the one fact
+    the user most wants to be able to trust.
+    """
+    medium = _clean_text(network_type, 16).lower()
+    if medium in {"none", "unknown", "other", "mixed"}:
+        medium = ""
+
+    # A cellular link never stays on the LAN, whatever an address suggests.
+    if medium == "cellular":
+        return "cellular"
+
+    if remote_is_private is True:
+        if medium == "wifi":
+            return "local_wifi"
+        if medium in {"ethernet", "wimax"}:
+            return "local_wired"
+        return "local"
+
+    if remote_is_private is False:
+        if medium == "wifi":
+            return "wifi"
+        if medium in {"ethernet", "wimax"}:
+            return "ethernet"
+        return "remote"
+
+    if medium == "wifi":
+        return "wifi"
+    if medium in {"ethernet", "wimax"}:
+        return "ethernet"
+    return "unknown"
+
+
+def _device(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """The device description a client reported about itself."""
+    return {
+        "model": _clean_text(payload.get("device_model"), MAX_DEVICE_TEXT),
+        "os": _clean_text(payload.get("device_os"), MAX_DEVICE_TEXT),
+        "browser": _clean_text(payload.get("device_browser"), MAX_DEVICE_TEXT),
+        "form_factor": _clean_text(payload.get("device_form_factor"), 16).lower(),
+        "screen": _clean_text(payload.get("device_screen"), 24),
+    }
+
+
+def _network(payload: Mapping[str, Any], connection: str) -> dict[str, Any]:
+    """The raw network evidence behind the ``connection`` verdict.
+
+    Kept alongside the verdict rather than thrown away: when the verdict reads
+    ``remote`` and you expected ``local_wifi``, these are the fields that say
+    which half of the reasoning to distrust.
+    """
+    return {
+        "type": connection,
+        # Exactly what navigator.connection reported, empty when the browser
+        # does not implement it -- which is most of them.
+        "reported_type": _clean_text(payload.get("network_type"), 16).lower(),
+        "effective_type": _clean_text(payload.get("effective_type"), 16).lower(),
+        "downlink_mbps": _finite(payload.get("downlink_mbps")),
+        "rtt_ms": _finite(payload.get("network_rtt_ms")),
+        "save_data": bool(payload.get("save_data")),
+        # As observed by the server; see observed_client_ip().
+        "client_ip": _clean_text(payload.get("client_ip"), 64),
+        "client_ip_source": _clean_text(payload.get("client_ip_source"), 24),
+        "via_cloudflare": bool(payload.get("via_cloudflare")),
+    }
+
+
 def normalise_report(payload: Mapping[str, Any], *, timestamp: str) -> dict[str, Any]:
     """Turn one ``connection_test.report`` service call into a stored entry.
 
@@ -150,13 +317,42 @@ def normalise_report(payload: Mapping[str, Any], *, timestamp: str) -> dict[str,
     upload_bytes = _finite(payload.get("upload_bytes")) or 0
     upload_seconds = _finite(payload.get("upload_seconds")) or 0
 
+    # The client reports the address the server told it about (via /info), so
+    # the scope verdict below rests on the server's own observation rather than
+    # on the hostname the client happens to be using. That distinction is the
+    # whole point: a phone sitting on the house Wi-Fi but loading the external
+    # URL is genuinely on an external path, and only the address can say so.
+    client_ip = _clean_text(payload.get("client_ip"), 64)
+    remote_is_private = is_private_address(client_ip)
+
+    if remote_is_private is True:
+        path = "internal"
+    elif remote_is_private is False:
+        path = "external"
+    else:
+        # No usable address: fall back to whatever the card concluded from its
+        # `internal_origins` list, which is a configured guess about hostnames.
+        path = _vocabulary(payload.get("path"), PATHS, "unknown")
+
+    connection = _vocabulary(
+        classify_connection(
+            network_type=payload.get("network_type"),
+            remote_is_private=remote_is_private,
+        ),
+        CONNECTION_TYPES,
+        "unknown",
+    )
+
     client_id = _clean_text(payload.get("client_id"), 64) or "unknown"
     return {
         "client_id": client_id,
         "client": _clean_text(payload.get("client_name"), 64) or client_id,
         "platform": _vocabulary(payload.get("platform"), PLATFORMS_CLIENT, "unknown"),
         "origin": _clean_text(payload.get("origin"), 128),
-        "path": _vocabulary(payload.get("path"), PATHS, "unknown"),
+        "path": path,
+        "connection": connection,
+        "device": _device(payload),
+        "network": _network(payload, connection),
         "user": _clean_text(payload.get("user"), 64),
         "user_agent": _clean_text(payload.get("user_agent")),
         "latency": latency,

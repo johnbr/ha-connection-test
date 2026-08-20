@@ -50,6 +50,7 @@ from .runtime import ConnectionTestRuntime
 from .views import (
     ConnectionTestDownloadView,
     ConnectionTestEchoView,
+    ConnectionTestInfoView,
     ConnectionTestUploadView,
 )
 
@@ -73,6 +74,24 @@ REPORT_SCHEMA = vol.Schema(
         vol.Optional("path"): cv.string,
         vol.Optional("user"): cv.string,
         vol.Optional("user_agent"): cv.string,
+        # What the device says it is. Free text from a browser, bounded in
+        # measure.py before it reaches an attribute.
+        vol.Optional("device_model"): cv.string,
+        vol.Optional("device_os"): cv.string,
+        vol.Optional("device_browser"): cv.string,
+        vol.Optional("device_form_factor"): cv.string,
+        vol.Optional("device_screen"): cv.string,
+        # How it got here. `client_ip` is echoed back from /info rather than
+        # claimed by the client, so it is the server's own observation making
+        # a round trip -- see normalise_report.
+        vol.Optional("client_ip"): cv.string,
+        vol.Optional("client_ip_source"): cv.string,
+        vol.Optional("via_cloudflare"): cv.boolean,
+        vol.Optional("network_type"): cv.string,
+        vol.Optional("effective_type"): cv.string,
+        vol.Optional("downlink_mbps"): vol.Coerce(float),
+        vol.Optional("network_rtt_ms"): vol.Coerce(float),
+        vol.Optional("save_data"): cv.boolean,
         # Bounded: this list is free input from a browser and every element
         # ends up summarised into a recorded attribute.
         vol.Optional("latency_samples_ms"): vol.All(cv.ensure_list, vol.Length(max=200), [vol.Coerce(float)]),
@@ -108,6 +127,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         payload = await hass.async_add_executor_job(os.urandom, RANDOM_BUFFER_BYTES)
 
         hass.http.register_view(ConnectionTestEchoView())
+        hass.http.register_view(ConnectionTestInfoView())
         hass.http.register_view(ConnectionTestDownloadView(payload))
         hass.http.register_view(ConnectionTestUploadView())
         # aiohttp has no route deregistration, so these outlive an unload. That

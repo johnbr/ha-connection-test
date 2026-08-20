@@ -31,6 +31,7 @@ CARD_FILENAME: Final = "connection-test-card.js"
 # request under /api/ is guaranteed to hit the network every time. Verified
 # against hass_frontend/service_worker.js in 2026.8.2.
 API_ECHO: Final = "/api/connection_test/echo"
+API_INFO: Final = "/api/connection_test/info"
 API_DOWNLOAD: Final = "/api/connection_test/download"
 API_UPLOAD: Final = "/api/connection_test/upload"
 
@@ -57,6 +58,12 @@ MAX_DOWNLOAD_BYTES: Final = 512 * 1024 * 1024
 MAX_UPLOAD_BYTES: Final = 128 * 1024 * 1024
 UPLOAD_CHUNK_BYTES: Final = 64 * 1024
 
+# Cloudflare rejects a request body over 100 MB on its free and pro plans, and
+# it does so with a 413 that looks exactly like a failed test. The client asks
+# /info whether this request arrived through Cloudflare -- CF-Ray is proof, not
+# a guess -- and caps itself here when it did.
+CLOUDFLARE_UPLOAD_CEILING_BYTES: Final = 64 * 1024 * 1024
+
 # --- Service ----------------------------------------------------------------
 SERVICE_REPORT: Final = "report"
 
@@ -78,3 +85,32 @@ SIGNAL_RESULT: Final = f"{DOMAIN}_result"
 # --- Vocabularies -----------------------------------------------------------
 PATHS: Final = frozenset({"internal", "external", "unknown"})
 PLATFORMS_CLIENT: Final = frozenset({"browser", "android_app", "ios_app", "unknown"})
+
+# How the client reached Home Assistant. Two orthogonal facts are folded into
+# one word because that is how it gets read on a dashboard:
+#
+#   SCOPE   did the request stay on the local network, or come in from outside?
+#           Decided by the server from the address it observed the client on --
+#           a fact, not an inference.
+#   MEDIUM  wifi / cellular / ethernet. Only the browser knows this, and only
+#           some browsers will say (`navigator.connection.type` is a Chromium
+#           thing, and on desktop it is absent even there).
+#
+# So `local_wifi` is "on the LAN, over Wi-Fi", `wifi` is "over Wi-Fi, but the
+# traffic left the building", and the bare `local` / `remote` are what is left
+# when the medium is unknowable. Cellular is never local by construction.
+CONNECTION_TYPES: Final = frozenset(
+    {
+        "local_wifi",
+        "local_wired",
+        "local",
+        "wifi",
+        "ethernet",
+        "cellular",
+        "remote",
+        "unknown",
+    }
+)
+
+# Free text describing the device, kept short: these land in sensor attributes.
+MAX_DEVICE_TEXT: Final = 64

@@ -6,8 +6,10 @@ const DOMAIN = "connection_test";
 const DOCS_URL = "https://github.com/johnbr/ha-connection-test";
 const STYLE_CLASS = "ct-card-style";
 const CLIENT_ID_KEY = "connection-test-client-id";
+const CLIENT_NAME_KEY = "connection-test-client-name";
 
 const API_ECHO = "/api/connection_test/echo";
+const API_INFO = "/api/connection_test/info";
 const API_DOWNLOAD = "/api/connection_test/download";
 const API_UPLOAD = "/api/connection_test/upload";
 
@@ -167,39 +169,187 @@ function classifyPath(origin, internalOrigins) {
  *
  * Both Companion apps inject a bridge into the WebView they render dashboards
  * in — `externalApp` on Android, a `webkit.messageHandlers.externalBus`
- * handler on iOS — and those are the only reliable signals; a user agent
- * string is not, because the app's WebView reports the system browser's.
+ * handler on iOS — and those are the primary signals. The user-agent check is
+ * a backstop: both apps append their own token to the WebView's user agent, so
+ * an app whose bridge has not been installed yet (it appears after the page
+ * has begun loading) is still recognised rather than reported as a browser.
  */
 function detectPlatform(win) {
   if (!win) return "unknown";
   if (win.externalApp) return "android_app";
   if (win.webkit && win.webkit.messageHandlers && win.webkit.messageHandlers.externalBus) return "ios_app";
+  const ua = (win.navigator && win.navigator.userAgent) || "";
+  if (/Home\s?Assistant\//i.test(ua)) return /iPhone|iPad|iPod|Macintosh/.test(ua) ? "ios_app" : "android_app";
   if (win.document) return "browser";
   return "unknown";
 }
 
-/** A readable default name, so a device is identifiable before anyone names it. */
-function defaultClientName(win) {
-  const platform = detectPlatform(win);
-  const ua = (win && win.navigator && win.navigator.userAgent) || "";
-  if (platform === "android_app") {
-    const model = /Android [\d.]+; ([^);]+)/.exec(ua);
-    return model ? `${model[1].trim()} (Android app)` : "Android app";
+/**
+ * Ask Chromium for the details it keeps out of the user-agent string.
+ *
+ * THIS IS THE ONLY WAY TO LEARN AN ANDROID DEVICE'S MODEL from a modern
+ * browser. Chrome's user-agent reduction replaced the model with the literal
+ * "K" and froze the Android version at "10", so every Pixel, Galaxy and tablet
+ * on the network parses out of the user agent as the same non-device — which
+ * is exactly why two different devices here were both reporting themselves as
+ * plain "Chrome browser". `getHighEntropyValues` returns the real model.
+ *
+ * It is Chromium-only and async, and it resolves to null everywhere else
+ * (Safari, Firefox), which is why the user-agent parser below still exists as
+ * a fallback rather than being replaced by this.
+ */
+async function highEntropyHints(win) {
+  const data = win && win.navigator && win.navigator.userAgentData;
+  if (!data || typeof data.getHighEntropyValues !== "function") return null;
+  try {
+    const hints = await data.getHighEntropyValues(["platform", "platformVersion", "model", "architecture"]);
+    return { ...hints, mobile: data.mobile, brands: data.brands };
+  } catch (err) {
+    // Rejects in some embedded WebViews. Not worth surfacing: the user-agent
+    // fallback covers it, just less precisely.
+    return null;
   }
-  if (platform === "ios_app") {
-    if (/iPad/.test(ua)) return "iPad app";
-    return "iPhone app";
+}
+
+/** Strip the values Chrome's user-agent reduction substitutes for real ones. */
+function realModel(value) {
+  const model = String(value || "").trim();
+  if (!model || model === "K" || /^Android$/i.test(model)) return "";
+  // WebViews append the build fingerprint to the model.
+  return model.replace(/\s+Build\/.*$/i, "").trim();
+}
+
+function parseUserAgent(ua, win) {
+  const text = String(ua || "");
+  const touch = (win && win.navigator && win.navigator.maxTouchPoints) || 0;
+  let os = "";
+  let model = "";
+  let formFactor = "desktop";
+
+  let match;
+  if ((match = /Android\s+([\d.]+)/.exec(text))) {
+    os = `Android ${match[1]}`;
+    const device = /Android\s+[\d.]+;\s*([^;)]+)/.exec(text);
+    model = realModel(device && device[1]);
+    // Chrome marks phones with a "Mobile" token and omits it for tablets.
+    formFactor = /\bMobile\b/.test(text) ? "phone" : "tablet";
+  } else if ((match = /(?:iPhone|CPU) OS ([\d_]+)/.exec(text)) && /iPhone|iPad|iPod/.test(text)) {
+    os = `iOS ${match[1].replace(/_/g, ".")}`;
+    model = /iPad/.test(text) ? "iPad" : "iPhone";
+    formFactor = /iPad/.test(text) ? "tablet" : "phone";
+  } else if (/Macintosh/.test(text)) {
+    // iPadOS Safari asks for desktop pages and calls itself a Mac. A Mac has
+    // no touchscreen, so the touch-point count separates them.
+    if (touch > 1) {
+      os = "iPadOS";
+      model = "iPad";
+      formFactor = "tablet";
+    } else {
+      match = /Mac OS X ([\d_]+)/.exec(text);
+      os = match ? `macOS ${match[1].replace(/_/g, ".")}` : "macOS";
+      model = "Mac";
+    }
+  } else if (/CrOS/.test(text)) {
+    os = "ChromeOS";
+  } else if ((match = /Windows NT ([\d.]+)/.exec(text))) {
+    // 10.0 covers both Windows 10 and 11; the user agent cannot tell them
+    // apart, and claiming one of them would be a coin flip.
+    os = match[1] === "10.0" ? "Windows 10/11" : `Windows NT ${match[1]}`;
+  } else if (/Linux|X11/.test(text)) {
+    os = "Linux";
   }
+
+  return { os, model, formFactor };
+}
+
+function parseBrowser(ua, hints) {
+  const brands = (hints && hints.brands) || [];
+  // Chromium sends a deliberately absurd padding brand ("Not)A;Brand") to stop
+  // anyone matching the list exactly. Drop it, and prefer a named browser over
+  // the generic Chromium entry that always accompanies it.
+  const named = brands
+    .filter((entry) => entry && entry.brand && !/not.{0,2}a.{0,2}brand/i.test(entry.brand))
+    .sort((a, b) => (/chromium/i.test(a.brand) ? 1 : 0) - (/chromium/i.test(b.brand) ? 1 : 0));
+  if (named.length) {
+    const major = String(named[0].version || "").split(".")[0];
+    return major ? `${named[0].brand} ${major}` : named[0].brand;
+  }
+  const text = String(ua || "");
   for (const [pattern, name] of [
-    [/Edg\//, "Edge"],
-    [/OPR\//, "Opera"],
-    [/Firefox\//, "Firefox"],
-    [/Chrome\//, "Chrome"],
-    [/Safari\//, "Safari"],
+    [/Edg\/([\d.]+)/, "Edge"],
+    [/OPR\/([\d.]+)/, "Opera"],
+    [/Firefox\/([\d.]+)/, "Firefox"],
+    [/Chrome\/([\d.]+)/, "Chrome"],
+    [/Version\/([\d.]+).*Safari/, "Safari"],
   ]) {
-    if (pattern.test(ua)) return `${name} browser`;
+    const found = pattern.exec(text);
+    if (found) return `${name} ${String(found[1]).split(".")[0]}`;
   }
-  return "Browser";
+  return "";
+}
+
+/**
+ * Everything the client can work out about itself.
+ *
+ * `hints` is the resolved value of highEntropyHints(), or null. Passing it in
+ * rather than fetching it here keeps this function synchronous and pure, which
+ * is what lets the tests drive it with a fabricated window.
+ */
+function describeDevice(win, hints) {
+  const ua = (win && win.navigator && win.navigator.userAgent) || "";
+  const parsed = parseUserAgent(ua, win);
+
+  let os = parsed.os;
+  let model = parsed.model;
+  let formFactor = parsed.formFactor;
+
+  if (hints) {
+    if (hints.platform) {
+      const version = String(hints.platformVersion || "").split(".")[0];
+      os = version && version !== "0" ? `${hints.platform} ${version}` : hints.platform;
+    }
+    model = realModel(hints.model) || model;
+    if (typeof hints.mobile === "boolean") {
+      // `mobile` is a request for a mobile-formatted page, so it is true on
+      // phones and false on tablets AND desktops. It can promote a device to
+      // "phone" but never demote one — a tablet already identified as such
+      // from the user agent must not become a desktop here.
+      if (hints.mobile) formFactor = "phone";
+      else if (formFactor === "phone") formFactor = "tablet";
+    }
+  }
+
+  const platform = detectPlatform(win);
+  if (platform === "ios_app" && !model) model = /iPad/.test(ua) ? "iPad" : "iPhone";
+
+  const screen = win && win.screen ? `${win.screen.width}x${win.screen.height}@${win.devicePixelRatio || 1}` : "";
+
+  return {
+    os: os || "",
+    model: model || "",
+    browser: parseBrowser(ua, hints),
+    form_factor: formFactor,
+    screen,
+    platform,
+  };
+}
+
+/**
+ * A readable default name, so a device is identifiable before anyone names it.
+ *
+ * The device comes first and the software second, because the question this
+ * card answers is "which of my screens is slow" — "Pixel Tablet · Chrome",
+ * not "Chrome, on something". When the model is unknown the OS and form factor
+ * stand in for it, which is how a desktop becomes "Linux desktop" rather than
+ * the "Chrome browser" that every machine in the house used to report.
+ */
+function deviceLabel(device) {
+  const shape =
+    { phone: "phone", tablet: "tablet", desktop: "desktop", watch: "watch" }[device.form_factor] || "device";
+  const primary = device.model || (device.os ? `${device.os.replace(/\s+[\d.]+$/, "")} ${shape}` : `Unknown ${shape}`);
+  const app = { android_app: "HA app", ios_app: "HA app" }[device.platform];
+  const secondary = app || device.browser;
+  return secondary ? `${primary} · ${secondary}` : primary;
 }
 
 /**
@@ -225,6 +375,117 @@ function clientId(win) {
     if (!win.__connectionTestClientId) win.__connectionTestClientId = fresh();
     return win.__connectionTestClientId;
   }
+}
+
+/* ------------------------------------------------------------- the network */
+
+/**
+ * Whatever `navigator.connection` will tell us.
+ *
+ * Read defensively because this API is unevenly implemented: Chromium on
+ * Android populates `type` ("wifi" / "cellular" / "ethernet"), desktop
+ * Chromium omits `type` entirely and offers only the derived fields, and
+ * Safari and Firefox do not implement it at all. Everything here is therefore
+ * best-effort, and the raw values are reported alongside the verdict so a
+ * surprising verdict can be traced to the evidence rather than argued with.
+ */
+function readNetwork(win) {
+  const nav = (win && win.navigator) || {};
+  const conn = nav.connection || nav.mozConnection || nav.webkitConnection;
+  if (!conn) return { type: "", effectiveType: "", downlink: null, rtt: null, saveData: false };
+  const numeric = (value) => (Number.isFinite(Number(value)) ? Number(value) : null);
+  return {
+    type: String(conn.type || "").toLowerCase(),
+    effectiveType: String(conn.effectiveType || "").toLowerCase(),
+    // `downlink` and `rtt` are the browser's own coarse estimates from recent
+    // traffic — heavily rounded, and not a substitute for the measurement this
+    // card exists to take. Recorded as context, never shown as a result.
+    downlink: numeric(conn.downlink),
+    rtt: numeric(conn.rtt),
+    saveData: Boolean(conn.saveData),
+  };
+}
+
+/**
+ * Fold "did it stay on the LAN" and "over what medium" into one word.
+ *
+ * MIRRORS classify_connection() IN measure.py — the server recomputes this
+ * from the same inputs and is authoritative for what lands in entity state.
+ * The card needs its own copy only to label the run on screen immediately.
+ *
+ * `remoteIsPrivate` comes from the server (see /api/connection_test/info): it
+ * is the address Home Assistant actually saw the request arrive from, so the
+ * local/remote half is observed rather than inferred. The medium half is the
+ * browser's, and is often simply unavailable.
+ *
+ * `effectiveType` is deliberately ignored. It grades a link's behaviour
+ * ("4g", "3g"), not its nature — congested Wi-Fi reports "3g" — so reading
+ * cellular out of it would fabricate the one fact most worth trusting.
+ */
+function classifyConnection(networkType, remoteIsPrivate) {
+  let medium = String(networkType || "").toLowerCase();
+  if (["none", "unknown", "other", "mixed"].includes(medium)) medium = "";
+
+  // Cellular is never local, whatever address the far end reports.
+  if (medium === "cellular") return "cellular";
+
+  const wired = medium === "ethernet" || medium === "wimax";
+  if (remoteIsPrivate === true) {
+    if (medium === "wifi") return "local_wifi";
+    return wired ? "local_wired" : "local";
+  }
+  if (remoteIsPrivate === false) {
+    if (medium === "wifi") return "wifi";
+    return wired ? "ethernet" : "remote";
+  }
+  if (medium === "wifi") return "wifi";
+  return wired ? "ethernet" : "unknown";
+}
+
+const CONNECTION_LABELS = {
+  local_wifi: "Local Wi-Fi",
+  local_wired: "Local wired",
+  local: "Local network",
+  // The parenthetical is the finding, not decoration: a device on the house
+  // Wi-Fi loading the external URL lands here, and the round trip out to the
+  // internet is the reason its numbers look nothing like the LAN's.
+  wifi: "Wi-Fi · via internet",
+  ethernet: "Wired · via internet",
+  cellular: "Cellular",
+  remote: "Remote",
+  unknown: "Unknown network",
+};
+
+function connectionLabel(type) {
+  return CONNECTION_LABELS[type] || CONNECTION_LABELS.unknown;
+}
+
+/**
+ * A name for this device, chosen on this device.
+ *
+ * `client_name:` in the card config cannot do this job: one card configuration
+ * is served to every screen in the house, so a name set there names all of
+ * them at once. A per-device override has to live in per-device storage.
+ */
+function storedName(win) {
+  try {
+    return win.localStorage.getItem(CLIENT_NAME_KEY) || "";
+  } catch (err) {
+    return (win && win.__connectionTestClientName) || "";
+  }
+}
+
+function setStoredName(win, name) {
+  const value = String(name || "")
+    .trim()
+    .slice(0, 64);
+  try {
+    if (value) win.localStorage.setItem(CLIENT_NAME_KEY, value);
+    else win.localStorage.removeItem(CLIENT_NAME_KEY);
+  } catch (err) {
+    win.__connectionTestClientName = value;
+  }
+  return value;
 }
 
 /* -------------------------------------------------------------- formatting */
@@ -262,12 +523,27 @@ function fmtBytes(bytes) {
 const DEFAULTS = {
   title: "Connection Test",
   ping_count: 20,
-  target_seconds: 4,
+  // Eight seconds per direction. Long enough that TCP is well past slow-start
+  // and a transient stall is averaged rather than measured, short enough that
+  // nobody walks away from the card. The ceilings below, not this, are what
+  // bound a run on a fast link: at 1 Gbit/s the sizing wants 1 GB and gets the
+  // 512 MB cap instead, so the download finishes in about four seconds.
+  target_seconds: 8,
   download_streams: 4,
   min_download_mb: 2,
-  max_download_mb: 256,
+  // Matches the server's own MAX_DOWNLOAD_BYTES; asking for more is clamped
+  // server-side anyway, and the value the server reports from /info wins.
+  max_download_mb: 512,
   min_upload_mb: 1,
-  max_upload_mb: 64,
+  // The nginx default in front of Home Assistant is 128 MB and Cloudflare
+  // refuses anything over 100 MB. /info reports the real ceiling for THIS
+  // path, so this is only the ceiling on what may be asked for.
+  max_upload_mb: 128,
+  // Metered links get a smaller run. A full-size test is a few hundred
+  // megabytes, which is not something to spend out of someone's data
+  // allowance without saying so — the card labels a capped run as capped.
+  // Raise it if you would rather have the accuracy than the allowance.
+  cellular_max_mb: 64,
   report: true,
   internal_origins: [],
   client_name: "",
@@ -282,10 +558,11 @@ function resolveConfig(config) {
     return Number.isFinite(number) ? Math.max(min, Math.min(number, max)) : fallback;
   };
   merged.ping_count = clampInt(merged.ping_count, DEFAULTS.ping_count, 3, 100);
-  merged.target_seconds = clampInt(merged.target_seconds, DEFAULTS.target_seconds, 1, 20);
+  merged.target_seconds = clampInt(merged.target_seconds, DEFAULTS.target_seconds, 1, 30);
   merged.download_streams = clampInt(merged.download_streams, DEFAULTS.download_streams, 1, 8);
   merged.max_download_mb = clampInt(merged.max_download_mb, DEFAULTS.max_download_mb, 1, 512);
   merged.max_upload_mb = clampInt(merged.max_upload_mb, DEFAULTS.max_upload_mb, 1, 128);
+  merged.cellular_max_mb = clampInt(merged.cellular_max_mb, DEFAULTS.cellular_max_mb, 1, 512);
   merged.internal_origins = Array.isArray(merged.internal_origins) ? merged.internal_origins : [];
   return merged;
 }
@@ -318,6 +595,31 @@ async function measureLatency(hass, count, signal, onSample) {
 function authHeaders(hass) {
   const token = hass && hass.auth && hass.auth.accessToken;
   return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+/**
+ * Ask the server what it can see about this client.
+ *
+ * The two things it returns are things a browser cannot determine for itself:
+ * the address the request arrived from, and how large a body this path will
+ * carry. Both are treated as advisory — a failure here degrades the run to the
+ * old behaviour (config-based path labelling, config-based size caps) rather
+ * than failing it, because a missing label is worth far less than a missing
+ * measurement.
+ */
+async function fetchServerInfo(hass, signal) {
+  try {
+    const response = await fetch(`${API_INFO}?t=${Date.now()}`, {
+      cache: "no-store",
+      headers: authHeaders(hass),
+      signal,
+    });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch (err) {
+    if (err && err.name === "AbortError") throw err;
+    return null;
+  }
 }
 
 async function measureHttpLatency(hass, signal) {
@@ -417,7 +719,33 @@ const CARD_CSS = `
   .ct-root { padding: 16px; }
   .ct-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
   .ct-title { font-size: 1.1rem; font-weight: 500; color: var(--primary-text-color); }
-  .ct-context { font-size: 0.75rem; color: var(--secondary-text-color); word-break: break-all; }
+  .ct-context { font-size: 0.72rem; color: var(--secondary-text-color); word-break: break-all; margin-top: 2px; }
+  .ct-ident { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+  .ct-device { font-size: 0.9rem; font-weight: 500; color: var(--primary-text-color); }
+  .ct-chip {
+    font-size: 0.68rem; font-weight: 500; letter-spacing: 0.02em;
+    padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--divider-color); color: var(--secondary-text-color);
+  }
+  /* Local is the good case, so it is the only one that gets a colour; a row
+     of coloured chips would leave nothing for the exceptional case to say. */
+  .ct-chip[data-scope="local"] { color: var(--success-color); border-color: var(--success-color); }
+  .ct-chip[data-scope="remote"] { color: var(--warning-color); border-color: var(--warning-color); }
+  .ct-icon {
+    font: inherit; cursor: pointer; line-height: 1;
+    background: none; border: none; padding: 2px 6px; border-radius: 6px;
+    color: var(--secondary-text-color);
+  }
+  .ct-icon:hover { color: var(--primary-color); }
+  .ct-rename { display: flex; gap: 6px; margin: 8px 0; flex-wrap: wrap; }
+  .ct-rename[hidden] { display: none; }
+  .ct-input {
+    font: inherit; flex: 1 1 140px; min-width: 0;
+    padding: 8px 10px; border-radius: 8px;
+    border: 1px solid var(--divider-color);
+    background: var(--card-background-color); color: var(--primary-text-color);
+  }
+  .ct-switch { color: var(--primary-color); white-space: nowrap; }
   .ct-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
@@ -463,6 +791,13 @@ class ConnectionTestCard extends HTMLElement {
     this._shellBuilt = false;
     this._abort = null;
     this._nodes = {};
+    // Resolved once by _identify(); survives setConfig, because reconfiguring
+    // a card does not change what device it is running on.
+    this._identifying = null;
+    this._device = null;
+    // The server's last answer about this connection, so the identity block
+    // keeps its verdict between runs instead of reverting to "unknown".
+    this._info = null;
   }
 
   setConfig(config) {
@@ -508,23 +843,33 @@ class ConnectionTestCard extends HTMLElement {
     root.innerHTML = `
       <div class="ct-head">
         <div class="ct-title"></div>
-        <div class="ct-context"></div>
+        <button class="ct-icon" data-action="rename" title="Name this device">&#9998;</button>
+      </div>
+      <div class="ct-ident">
+        <span class="ct-device"></span>
+        <span class="ct-chip" data-field="conn"></span>
+      </div>
+      <div class="ct-context"></div>
+      <div class="ct-rename" hidden>
+        <input class="ct-input" type="text" maxlength="64" placeholder="Name this device" />
+        <button class="ct-btn ct-secondary" data-action="rename-save">Save</button>
+        <button class="ct-btn ct-secondary" data-action="rename-cancel">Cancel</button>
       </div>
       <div class="ct-warn" hidden></div>
       <div class="ct-grid">
         <div class="ct-metric">
           <span class="ct-label">Latency</span>
-          <span class="ct-value" data-field="latency">—</span><span class="ct-unit">ms</span>
+          <span class="ct-value" data-field="latency">&mdash;</span><span class="ct-unit">ms</span>
           <div class="ct-detail" data-field="latency-detail"></div>
         </div>
         <div class="ct-metric">
           <span class="ct-label">Download</span>
-          <span class="ct-value" data-field="download">—</span><span class="ct-unit">Mbit/s</span>
+          <span class="ct-value" data-field="download">&mdash;</span><span class="ct-unit">Mbit/s</span>
           <div class="ct-detail" data-field="download-detail"></div>
         </div>
         <div class="ct-metric">
           <span class="ct-label">Upload</span>
-          <span class="ct-value" data-field="upload">—</span><span class="ct-unit">Mbit/s</span>
+          <span class="ct-value" data-field="upload">&mdash;</span><span class="ct-unit">Mbit/s</span>
           <div class="ct-detail" data-field="upload-detail"></div>
         </div>
       </div>
@@ -540,7 +885,11 @@ class ConnectionTestCard extends HTMLElement {
 
     this._nodes = {
       title: root.querySelector(".ct-title"),
+      device: root.querySelector(".ct-device"),
+      conn: root.querySelector('[data-field="conn"]'),
       context: root.querySelector(".ct-context"),
+      rename: root.querySelector(".ct-rename"),
+      input: root.querySelector(".ct-input"),
       warn: root.querySelector(".ct-warn"),
       bar: root.querySelector(".ct-bar"),
       status: root.querySelector(".ct-status"),
@@ -561,32 +910,163 @@ class ConnectionTestCard extends HTMLElement {
     root.addEventListener("click", (event) => {
       const action = event.target && event.target.closest && event.target.closest("[data-action]");
       if (!action) return;
-      if (action.dataset.action === "run") this._run();
-      if (action.dataset.action === "cancel") this._cancel();
+      const what = action.dataset.action;
+      if (what === "run") this._run();
+      if (what === "cancel") this._cancel();
+      if (what === "rename") this._openRename();
+      if (what === "rename-save") this._saveRename();
+      if (what === "rename-cancel") this._closeRename();
+    });
+    this._nodes.input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") this._saveRename();
+      if (event.key === "Escape") this._closeRename();
     });
 
     this._shellBuilt = true;
     this._paintContext();
+    // Chromium's high-entropy hints are the only source for an Android model
+    // (see highEntropyHints), and they are async. Paint immediately from the
+    // user agent, then repaint when the better answer lands.
+    this._identify().then(() => this._shellBuilt && this._paintContext(this._info));
   }
 
-  _paintContext() {
-    const origin = (typeof window !== "undefined" && window.location && window.location.origin) || "";
-    const path = classifyPath(origin, this._config.internal_origins);
-    const name = this._config.client_name || defaultClientName(window);
-    this._nodes.context.textContent = `${name} · ${origin || "unknown origin"}`;
-
-    if (path === "external") {
-      this._nodes.warn.textContent =
-        "Measuring the external URL: these figures include the internet leg and anything in front of Home Assistant.";
-      this._nodes.warn.hidden = false;
-    } else if (path === "unknown") {
-      this._nodes.warn.textContent =
-        "Cannot tell whether this URL is local or remote. Set internal_origins on the card to label runs.";
-      this._nodes.warn.hidden = false;
-    } else {
-      this._nodes.warn.hidden = true;
+  /**
+   * Work out what this device is, once, and remember the promise.
+   *
+   * Cached as the promise rather than the result so that a run starting while
+   * the hints are still in flight waits for the same lookup instead of firing
+   * a second one.
+   */
+  _identify() {
+    if (!this._identifying) {
+      this._identifying = highEntropyHints(window)
+        .then((hints) => {
+          this._device = describeDevice(window, hints);
+          return this._device;
+        })
+        .catch(() => {
+          this._device = describeDevice(window, null);
+          return this._device;
+        });
     }
-    return { origin, path, name };
+    return this._identifying;
+  }
+
+  _openRename() {
+    this._nodes.input.value = storedName(window) || this._nodes.device.textContent || "";
+    this._nodes.rename.hidden = false;
+    this._nodes.input.focus();
+    this._nodes.input.select();
+  }
+
+  _closeRename() {
+    this._nodes.rename.hidden = true;
+  }
+
+  _saveRename() {
+    setStoredName(window, this._nodes.input.value);
+    this._closeRename();
+    this._paintContext(this._info);
+  }
+
+  /**
+   * Repaint the identity block, and return the context a run should report.
+   *
+   * `info` is the server's answer from /api/connection_test/info, absent
+   * before the first run. Without it the local/remote verdict falls back to
+   * matching the origin against the configured `internal_origins`, which is a
+   * guess about hostnames rather than an observation about addresses.
+   */
+  _paintContext(info) {
+    this._info = info || this._info || null;
+    const served = this._info;
+
+    const origin = (typeof window !== "undefined" && window.location && window.location.origin) || "";
+    const device = this._device || describeDevice(window, null);
+    const network = readNetwork(window);
+
+    const remoteIsPrivate =
+      served && typeof served.client_ip_is_private === "boolean" ? served.client_ip_is_private : null;
+    const connection = classifyConnection(network.type, remoteIsPrivate);
+    const path =
+      remoteIsPrivate === null
+        ? classifyPath(origin, this._config.internal_origins)
+        : remoteIsPrivate
+          ? "internal"
+          : "external";
+
+    // Precedence: what this device was named here, then what the dashboard
+    // named every device, then what the device looks like. The per-device name
+    // wins because it is the only one that can differ per device.
+    const name = storedName(window) || this._config.client_name || deviceLabel(device);
+
+    this._nodes.device.textContent = name;
+    this._nodes.conn.textContent = connectionLabel(connection);
+    this._nodes.conn.dataset.scope = connection.startsWith("local")
+      ? "local"
+      : connection === "unknown"
+        ? "unknown"
+        : "remote";
+
+    const ip = served && served.client_ip ? served.client_ip : "";
+    this._nodes.context.textContent = ip ? `${origin || "unknown origin"} — seen as ${ip}` : origin || "unknown origin";
+
+    this._paintWarning(origin, path, served);
+
+    return { origin, path, name, device, network, connection, info: served };
+  }
+
+  /**
+   * Say what the current path means, and offer the other one where there is
+   * one to offer.
+   *
+   * The interesting case is a device sitting on the house network that has
+   * loaded the external URL: its traffic leaves the building and comes back,
+   * and every number on this card is then describing that round trip rather
+   * than the LAN. That is not an error, and the card must not present it as
+   * one — but it is almost always the answer to "why is this slow", so it gets
+   * a link to the internal origin rather than only a sentence.
+   */
+  _paintWarning(origin, path, served) {
+    const warn = this._nodes.warn;
+    warn.textContent = "";
+
+    if (path === "internal") {
+      warn.hidden = true;
+      return;
+    }
+
+    if (path === "unknown") {
+      // Only a complaint once the server has actually been asked and could not
+      // say. Before the first run there is simply nothing to report yet, and a
+      // warning on a card nobody has pressed reads as a fault.
+      warn.hidden = !served;
+      if (served) {
+        warn.textContent =
+          "Could not tell whether this connection is local or remote — the proxy in front of Home Assistant is not passing the client address on.";
+      }
+      return;
+    }
+
+    const cloudflare = served && served.via_cloudflare;
+    warn.textContent = cloudflare
+      ? "This run goes out to the internet and back through Cloudflare, which also caps the upload at 100 MB."
+      : "This run goes out to the internet and back, so it measures that path rather than the local network.";
+
+    // Only offer an origin that is configured AND is not the one already in
+    // use; the link keeps the current dashboard path so it lands on this card.
+    const alternatives = (this._config.internal_origins || []).filter(
+      (candidate) => String(candidate).replace(/\/+$/, "").toLowerCase() !== String(origin).toLowerCase()
+    );
+    if (alternatives.length) {
+      const link = document.createElement("a");
+      link.className = "ct-switch";
+      link.href = `${String(alternatives[0]).replace(/\/+$/, "")}${window.location.pathname}${window.location.search}`;
+      link.textContent = `Open on ${hostOf(alternatives[0])}`;
+      warn.appendChild(document.createTextNode(" "));
+      warn.appendChild(link);
+    }
+    warn.hidden = false;
   }
 
   _status(text, tone) {
@@ -617,7 +1097,6 @@ class ConnectionTestCard extends HTMLElement {
     }
 
     const config = this._config;
-    const context = this._paintContext();
     const controller = new AbortController();
     this._abort = controller;
     this._busy(true);
@@ -629,6 +1108,28 @@ class ConnectionTestCard extends HTMLElement {
     }
 
     try {
+      await this._identify();
+
+      /* ---- what the server can see that we cannot ---- */
+      this._status("Checking the connection…");
+      const info = await fetchServerInfo(hass, controller.signal);
+      const context = this._paintContext(info);
+
+      // Ceilings, tightest wins: the card's own configuration, whatever the
+      // server says this path will carry (Cloudflare's 100 MB, or the proxy's
+      // limit), and a smaller allowance on a metered link.
+      const serverMaxDown = Number(info && info.max_download_bytes) || Infinity;
+      const serverMaxUp = Number(info && info.max_upload_bytes) || Infinity;
+      let maxDown = Math.min(config.max_download_mb * MB, serverMaxDown);
+      let maxUp = Math.min(config.max_upload_mb * MB, serverMaxUp);
+      let capNote = "";
+      if (context.connection === "cellular") {
+        const cap = config.cellular_max_mb * MB;
+        if (cap < maxDown || cap < maxUp) capNote = " · capped for cellular";
+        maxDown = Math.min(maxDown, cap);
+        maxUp = Math.min(maxUp, cap);
+      }
+
       /* ---- latency (websocket) ---- */
       this._status("Measuring latency…");
       const samples = await measureLatency(hass, config.ping_count, controller.signal, (taken) => {
@@ -644,13 +1145,17 @@ class ConnectionTestCard extends HTMLElement {
 
       /* ---- download ---- */
       this._status("Measuring download…");
-      const minDown = config.min_download_mb * MB;
-      const maxDown = config.max_download_mb * MB;
+      const minDown = Math.min(config.min_download_mb * MB, maxDown);
       // The probe doubles as connection warm-up: it opens (and TLS-handshakes)
       // the sockets the measured run then reuses via keep-alive, so setup cost
       // is not billed to the throughput figure.
       const probe = await measureDownload(hass, minDown, 1, controller.signal, null);
-      const downloadSize = nextSize(mbitsPerSecond(probe.bytes, probe.seconds), config.target_seconds, minDown, maxDown);
+      const downloadSize = nextSize(
+        mbitsPerSecond(probe.bytes, probe.seconds),
+        config.target_seconds,
+        minDown,
+        maxDown
+      );
 
       let downloaded = 0;
       const download = await measureDownload(
@@ -665,31 +1170,48 @@ class ConnectionTestCard extends HTMLElement {
       );
       const downloadMbps = mbitsPerSecond(download.bytes, download.seconds);
       this._nodes.download.textContent = fmtRate(downloadMbps);
-      this._nodes.downloadDetail.textContent = `${fmtBytes(download.bytes)} in ${download.seconds.toFixed(1)}s · ${download.streams} streams`;
+      this._nodes.downloadDetail.textContent = `${fmtBytes(download.bytes)} in ${download.seconds.toFixed(1)}s · ${download.streams} streams${capNote}`;
 
       /* ---- upload ---- */
       this._status("Measuring upload…");
-      const minUp = config.min_upload_mb * MB;
-      const maxUp = config.max_upload_mb * MB;
+      const minUp = Math.min(config.min_upload_mb * MB, maxUp);
       const upProbe = await measureUpload(hass, minUp, controller.signal);
       const uploadSize = nextSize(mbitsPerSecond(upProbe.bytes, upProbe.seconds), config.target_seconds, minUp, maxUp);
       this._progress(0.75);
       const upload = await measureUpload(hass, uploadSize, controller.signal);
       const uploadMbps = mbitsPerSecond(upload.bytes, upload.seconds);
       this._nodes.upload.textContent = fmtRate(uploadMbps);
-      this._nodes.uploadDetail.textContent = `${fmtBytes(upload.bytes)} in ${upload.seconds.toFixed(1)}s`;
+      this._nodes.uploadDetail.textContent = `${fmtBytes(upload.bytes)} in ${upload.seconds.toFixed(1)}s${capNote}`;
       this._progress(1);
 
       /* ---- report ---- */
       if (config.report) {
+        const device = context.device;
+        const network = context.network;
         await hass.callService(DOMAIN, "report", {
           client_id: clientId(window),
           client_name: context.name,
-          platform: detectPlatform(window),
+          platform: device.platform,
           origin: context.origin,
           path: context.path,
           user: (hass.user && hass.user.name) || "",
           user_agent: (window.navigator && window.navigator.userAgent) || "",
+          device_model: device.model,
+          device_os: device.os,
+          device_browser: device.browser,
+          device_form_factor: device.form_factor,
+          device_screen: device.screen,
+          // Echoed straight back from /info. The server re-derives the
+          // internal/external verdict from it rather than trusting `path`
+          // above, which is why sending it matters.
+          client_ip: (info && info.client_ip) || "",
+          client_ip_source: (info && info.client_ip_source) || "",
+          via_cloudflare: Boolean(info && info.via_cloudflare),
+          network_type: network.type,
+          effective_type: network.effectiveType,
+          downlink_mbps: network.downlink,
+          network_rtt_ms: network.rtt,
+          save_data: network.saveData,
           latency_samples_ms: samples.map((value) => Math.round(value * 100) / 100),
           http_latency_ms: httpLatency,
           download_bytes: download.bytes,
@@ -699,7 +1221,7 @@ class ConnectionTestCard extends HTMLElement {
           upload_seconds: upload.seconds,
         });
       }
-      this._status("Done.", "ok");
+      this._status(`Done · ${connectionLabel(context.connection)}.`, "ok");
     } catch (err) {
       if (err && err.name === "AbortError") {
         this._status("Cancelled.");
@@ -744,7 +1266,14 @@ if (typeof module !== "undefined" && module.exports) {
     isPrivateHost,
     classifyPath,
     detectPlatform,
-    defaultClientName,
+    describeDevice,
+    deviceLabel,
+    parseUserAgent,
+    parseBrowser,
+    realModel,
+    readNetwork,
+    classifyConnection,
+    connectionLabel,
     clientId,
     fmtRate,
     fmtMs,

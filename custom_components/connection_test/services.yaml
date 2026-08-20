@@ -41,6 +41,72 @@ report:
     user_agent:
       selector:
         text:
+    device_model:
+      example: "Pixel 9 Pro"
+      selector:
+        text:
+    device_os:
+      example: "Android 16"
+      selector:
+        text:
+    device_browser:
+      example: "Chrome 141"
+      selector:
+        text:
+    device_form_factor:
+      example: "phone"
+      selector:
+        select:
+          options:
+            - phone
+            - tablet
+            - desktop
+            - watch
+            - unknown
+    device_screen:
+      example: "1280x800@2"
+      selector:
+        text:
+    client_ip:
+      # Echoed back from /api/connection_test/info -- the address the SERVER
+      # observed. It decides whether the run is labelled internal or external,
+      # so it is the server's own observation making a round trip rather than
+      # something the client knows about itself.
+      example: "172.31.4.57"
+      selector:
+        text:
+    client_ip_source:
+      example: "x-real-ip"
+      selector:
+        text:
+    via_cloudflare:
+      selector:
+        boolean:
+    network_type:
+      # Raw navigator.connection.type. Absent in most browsers; when it is,
+      # the connection verdict falls back to the address alone.
+      example: "wifi"
+      selector:
+        text:
+    effective_type:
+      example: "4g"
+      selector:
+        text:
+    downlink_mbps:
+      selector:
+        number:
+          min: 0
+          max: 10000
+          mode: box
+    network_rtt_ms:
+      selector:
+        number:
+          min: 0
+          max: 60000
+          mode: box
+    save_data:
+      selector:
+        boolean:
     latency_samples_ms:
       example: "[8.1, 7.4, 9.6]"
       selector:

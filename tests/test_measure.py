@@ -244,3 +244,206 @@ def test_iter_windows_yields_nothing_for_degenerate_requests(total, chunk) -> No
 
 def test_iter_windows_tolerates_an_empty_buffer() -> None:
     assert list(measure.iter_windows(memoryview(b""), 100, 10)) == []
+
+
+# ------------------------------------------------------- the client address
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("172.31.4.57", True),
+        ("10.0.0.1", True),
+        ("192.168.1.5", True),
+        ("127.0.0.1", True),
+        ("169.254.3.4", True),
+        ("fd00::1", True),
+        ("fe80::1", True),
+        ("8.8.8.8", False),
+        ("99.9.60.109", False),
+        # NOT globally routable, so NOT a usable stand-in for a public address
+        # in a test -- 203.0.113.0/24 is TEST-NET-3 and reads as local here.
+        ("203.0.113.9", True),
+        # Carrier-grade NAT: the case a private/loopback/link-local test misses.
+        ("100.64.1.1", True),
+        # What a dual-stack socket reports for an IPv4 client.
+        ("::ffff:172.31.4.57", True),
+        ("fe80::1%eth0", True),
+        ("2606:4700::1111", False),
+        # Not an address at all is a THIRD outcome, not a False: "no evidence"
+        # and "evidence that it is public" lead to different labels.
+        ("", None),
+        ("halan.example.net", None),
+        (None, None),
+    ],
+)
+def test_is_private_address(value, expected) -> None:
+    assert measure.is_private_address(value) is expected
+
+
+def test_observed_client_ip_prefers_the_nearest_proxys_own_header() -> None:
+    """nginx sets X-Real-IP from $remote_addr after its own real_ip pass."""
+    address, source = measure.observed_client_ip(
+        {"X-Real-IP": "172.31.4.57", "X-Forwarded-For": "1.2.3.4, 172.31.4.57"},
+        "127.0.0.1",
+    )
+    assert (address, source) == ("172.31.4.57", "x-real-ip")
+
+
+def test_observed_client_ip_prefers_cloudflare_when_it_is_in_front() -> None:
+    address, source = measure.observed_client_ip(
+        {"CF-Connecting-IP": "8.8.8.8", "X-Real-IP": "172.68.1.1"},
+        "127.0.0.1",
+    )
+    assert (address, source) == ("8.8.8.8", "cf-connecting-ip")
+
+
+def test_observed_client_ip_uses_the_peer_when_there_is_no_proxy() -> None:
+    """Home Assistant reached directly on the LAN, no proxy involved."""
+    assert measure.observed_client_ip({}, "172.31.4.57") == ("172.31.4.57", "peer")
+
+
+def test_observed_client_ip_ignores_headers_from_a_remote_peer() -> None:
+    """A request off the internet cannot dress itself up as local.
+
+    Proxy headers are only believed when the peer is itself local, which is
+    the signature of an actual proxy sitting in front. This is the half of the
+    rule that matters, because the alternative lets any remote client claim an
+    RFC1918 address and be labelled internal.
+    """
+    address, source = measure.observed_client_ip(
+        {"X-Real-IP": "172.31.4.57", "CF-Connecting-IP": "10.0.0.1"},
+        "8.8.8.8",
+    )
+    assert (address, source) == ("8.8.8.8", "peer")
+
+
+def test_observed_client_ip_falls_back_to_x_forwarded_for() -> None:
+    address, source = measure.observed_client_ip({"X-Forwarded-For": "8.8.8.8, 172.18.0.1"}, "172.18.0.1")
+    assert (address, source) == ("8.8.8.8", "x-forwarded-for")
+
+
+def test_observed_client_ip_reports_unknown_rather_than_a_hostname() -> None:
+    assert measure.observed_client_ip({}, "not-an-address") == ("", "unknown")
+
+
+# ---------------------------------------------------- connection classification
+
+
+@pytest.mark.parametrize(
+    ("network_type", "private", "expected"),
+    [
+        ("wifi", True, "local_wifi"),
+        ("ethernet", True, "local_wired"),
+        ("wifi", False, "wifi"),
+        ("ethernet", False, "ethernet"),
+        # The common case: the browser does not implement
+        # navigator.connection.type, so only the scope is known.
+        ("", True, "local"),
+        ("", False, "remote"),
+        (None, True, "local"),
+        # Placeholders the API uses for "I don't know" must not become a medium.
+        ("unknown", True, "local"),
+        ("none", False, "remote"),
+        ("other", False, "remote"),
+        # Nothing known at all.
+        ("", None, "unknown"),
+        ("wifi", None, "wifi"),
+    ],
+)
+def test_classify_connection(network_type, private, expected) -> None:
+    assert measure.classify_connection(network_type=network_type, remote_is_private=private) == expected
+
+
+def test_classify_connection_never_calls_cellular_local() -> None:
+    """A carrier NAT hands out RFC1918 addresses; the medium overrules it."""
+    assert measure.classify_connection(network_type="cellular", remote_is_private=True) == "cellular"
+    assert measure.classify_connection(network_type="cellular", remote_is_private=False) == "cellular"
+
+
+def test_classify_connection_mirrors_the_card() -> None:
+    """Same inputs, same word — see the module docstring on duplication."""
+    assert set(const.CONNECTION_TYPES) >= {
+        measure.classify_connection(network_type=medium, remote_is_private=scope)
+        for medium in ("wifi", "cellular", "ethernet", "", "nonsense")
+        for scope in (True, False, None)
+    }
+
+
+# ------------------------------------------------------ report normalisation
+
+
+def _report(**overrides):
+    payload = {
+        "client_id": "abc",
+        "client_name": "Pixel 9 Pro · Chrome 141",
+        "latency_samples_ms": [10.0, 12.0],
+        "download_bytes": 8_000_000,
+        "download_seconds": 4.0,
+        "upload_bytes": 1_000_000,
+        "upload_seconds": 2.0,
+    }
+    payload.update(overrides)
+    return measure.normalise_report(payload, timestamp="2026-08-20T12:00:00+00:00")
+
+
+def test_normalise_report_derives_path_from_the_observed_address() -> None:
+    """The address wins over the client's own claim about its hostname.
+
+    This is the fix for the case that prompted it: a phone on the house Wi-Fi
+    loading the external URL. The hostname says nothing useful; the address the
+    server saw the request arrive from settles it.
+    """
+    internal = _report(client_ip="172.31.4.57", path="external")
+    assert internal["path"] == "internal"
+    assert internal["connection"] == "local"
+
+    external = _report(client_ip="8.8.8.8", path="internal")
+    assert external["path"] == "external"
+    assert external["connection"] == "remote"
+
+
+def test_normalise_report_falls_back_to_the_reported_path() -> None:
+    """No usable address (a proxy that strips headers) — use the card's guess."""
+    assert _report(path="internal")["path"] == "internal"
+    assert _report(path="banana")["path"] == "unknown"
+
+
+def test_normalise_report_keeps_the_evidence_beside_the_verdict() -> None:
+    entry = _report(
+        client_ip="8.8.8.8",
+        client_ip_source="cf-connecting-ip",
+        via_cloudflare=True,
+        network_type="wifi",
+        effective_type="4g",
+        downlink_mbps=10,
+        network_rtt_ms=50,
+        device_model="Pixel Tablet",
+        device_os="Android 16",
+        device_browser="Google Chrome 141",
+        device_form_factor="TABLET",
+    )
+    assert entry["connection"] == "wifi"
+    assert entry["network"]["reported_type"] == "wifi"
+    assert entry["network"]["via_cloudflare"] is True
+    assert entry["network"]["client_ip_source"] == "cf-connecting-ip"
+    assert entry["device"]["model"] == "Pixel Tablet"
+    assert entry["device"]["form_factor"] == "tablet"
+
+
+def test_normalise_report_bounds_free_text_from_the_browser() -> None:
+    """Every one of these lands in a recorded attribute."""
+    entry = _report(device_model="x" * 500, device_os="y" * 500, client_ip="z" * 500)
+    assert len(entry["device"]["model"]) == const.MAX_DEVICE_TEXT
+    assert len(entry["device"]["os"]) == const.MAX_DEVICE_TEXT
+    assert len(entry["network"]["client_ip"]) == 64
+    # Nonsense in the address field must not silently become "internal".
+    assert entry["path"] == "unknown"
+
+
+def test_normalise_report_survives_a_payload_with_nothing_but_the_id() -> None:
+    entry = measure.normalise_report({"client_id": "abc"}, timestamp="2026-08-20T12:00:00+00:00")
+    assert entry["client"] == "abc"
+    assert entry["connection"] == "unknown"
+    assert entry["path"] == "unknown"
+    assert entry["download"]["mbps"] is None

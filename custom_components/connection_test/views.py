@@ -20,13 +20,21 @@ from homeassistant.components.http import HomeAssistantView
 from .const import (
     API_DOWNLOAD,
     API_ECHO,
+    API_INFO,
     API_UPLOAD,
+    CLOUDFLARE_UPLOAD_CEILING_BYTES,
     DOMAIN,
+    MAX_DOWNLOAD_BYTES,
     MAX_UPLOAD_BYTES,
     STREAM_CHUNK_BYTES,
     UPLOAD_CHUNK_BYTES,
 )
-from .measure import clamp_download_bytes, iter_windows
+from .measure import (
+    clamp_download_bytes,
+    is_private_address,
+    iter_windows,
+    observed_client_ip,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,6 +69,58 @@ class ConnectionTestEchoView(HomeAssistantView):
 
     async def get(self, request: web.Request) -> web.Response:
         return web.Response(status=HTTPStatus.NO_CONTENT, headers=NO_STORE)
+
+
+class ConnectionTestInfoView(HomeAssistantView):
+    """What the server can see about this client that the client cannot.
+
+    Two things, and both change what a result means.
+
+    THE ADDRESS THE REQUEST ARRIVED FROM. A browser has no way to learn its own
+    network address, and the hostname it is using does not answer the question
+    either -- an internal name can be reached over a VPN and an external name
+    can be loaded while sitting on the same Wi-Fi as the server, which is the
+    case that confuses people. Whether the address the server saw is private is
+    a fact, and it is the one the ``internal``/``external`` verdict now rests
+    on.
+
+    THE SIZE THE PATH WILL TOLERATE. Cloudflare rejects request bodies over
+    100 MB, so an upload test sized for the link rather than the path fails at
+    a ceiling nothing on the client side knows about. ``CF-Ray`` is present
+    exactly when a request came through Cloudflare, so this is detection, not
+    a guess about hostnames.
+    """
+
+    url = API_INFO
+    name = f"api:{DOMAIN}:info"
+    requires_auth = True
+
+    async def get(self, request: web.Request) -> web.Response:
+        address, source = observed_client_ip(request.headers, request.remote)
+        private = is_private_address(address)
+
+        # Cloudflare stamps every request it proxies with CF-Ray. Anything that
+        # only sets CF-Connecting-IP is something imitating Cloudflare, so both
+        # are required before the ceiling is applied.
+        via_cloudflare = bool(request.headers.get("CF-Ray")) and bool(request.headers.get("CF-Connecting-IP"))
+
+        max_upload = MAX_UPLOAD_BYTES
+        if via_cloudflare:
+            max_upload = min(max_upload, CLOUDFLARE_UPLOAD_CEILING_BYTES)
+
+        return self.json(
+            {
+                "client_ip": address,
+                "client_ip_source": source,
+                # Tri-state on purpose: null means "no address to judge", which
+                # is different from "judged, and it is public".
+                "client_ip_is_private": private,
+                "via_cloudflare": via_cloudflare,
+                "max_upload_bytes": max_upload,
+                "max_download_bytes": MAX_DOWNLOAD_BYTES,
+            },
+            headers=NO_STORE,
+        )
 
 
 class ConnectionTestDownloadView(HomeAssistantView):
