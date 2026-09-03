@@ -154,14 +154,143 @@ function isPrivateHost(host) {
  * the numbers mean and a wrong label is worse than an absent one.
  */
 function classifyPath(origin, internalOrigins) {
-  const normalise = (value) =>
-    String(value || "")
-      .replace(/\/+$/, "")
-      .toLowerCase();
-  const configured = (internalOrigins || []).map(normalise).filter(Boolean);
-  const current = normalise(origin);
+  const configured = (internalOrigins || []).map(normaliseOrigin).filter(Boolean);
+  const current = normaliseOrigin(origin);
   if (configured.length) return configured.includes(current) ? "internal" : "external";
   return isPrivateHost(hostOf(current)) ? "internal" : "unknown";
+}
+
+/* --------------------------------------------------------------- targeting */
+
+/** One spelling of an origin, so two of them can be compared. */
+function normaliseOrigin(value) {
+  return String(value || "")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
+
+/** The origin this dashboard was loaded from, "" where there is no window. */
+function pageOriginOf(win) {
+  return (win && win.location && win.location.origin) || "";
+}
+
+/**
+ * The URL to offer as "measure the internet path instead".
+ *
+ * Configured `external_origin` first, because a page loaded from a LAN URL has
+ * no other way to name it. Failing that, the page's own origin serves when the
+ * page itself came in from outside -- which is the case where a run was
+ * switched onto the LAN and the user wants the original path back.
+ */
+function externalTarget(pageOrigin, config) {
+  const configured = normaliseOrigin(config && config.external_origin);
+  if (configured) return configured;
+  const current = normaliseOrigin(pageOrigin);
+  return classifyPath(current, (config && config.internal_origins) || []) === "internal" ? "" : current;
+}
+
+/**
+ * Which internal URLs are worth trying before this run starts?
+ *
+ * THE POINT OF THIS IS TO MEASURE THE PATH THE COMPANION APP WOULD USE, not
+ * the one the dashboard happens to have been loaded from. The app switches
+ * between an internal and an external URL by SSID; a browser tab does not, so
+ * a phone sitting on the house Wi-Fi with the public URL open sends every
+ * request out to the internet and back, and the card then reports that round
+ * trip as if it were the connection to Home Assistant.
+ *
+ * The switch only ever runs one way. A page already loaded from an internal
+ * origin is on the LAN by construction -- the page could not have loaded
+ * otherwise -- so there is nothing to probe and nothing to gain. The reverse,
+ * an external page that can also reach the LAN, is the case worth catching.
+ */
+function internalCandidates(pageOrigin, config) {
+  if (!config || config.prefer_internal === false) return [];
+  const configured = (config.internal_origins || []).map(normaliseOrigin).filter(Boolean);
+  if (!configured.length) return [];
+  const current = normaliseOrigin(pageOrigin);
+  if (configured.includes(current)) return [];
+  return configured;
+}
+
+/**
+ * An AbortSignal that gives up on its own after `ms`, and follows `outer`.
+ *
+ * `AbortSignal.any`/`AbortSignal.timeout` would be the modern spelling; this
+ * card runs in Companion WebViews old enough not to have either, and a probe
+ * that throws a TypeError on an old phone would silently disable the feature
+ * on exactly the devices most likely to need it.
+ */
+function deadlineSignal(outer, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  const relay = () => controller.abort();
+  if (outer) {
+    if (outer.aborted) controller.abort();
+    else outer.addEventListener("abort", relay, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    done: () => {
+      clearTimeout(timer);
+      if (outer && outer.removeEventListener) outer.removeEventListener("abort", relay);
+    },
+  };
+}
+
+/**
+ * Can this device open a connection to `origin` at all?
+ *
+ * `mode: "no-cors"` is what makes this answerable. The reply is opaque -- no
+ * status, no body, and the Authorization header is dropped before it is sent,
+ * so Home Assistant answers 401 -- but the promise still RESOLVES, and that
+ * resolution is the whole signal: TCP connected, TLS verified, HTTP answered.
+ * A CORS-enabled request cannot separate "the host is not there" from "the
+ * host is there and did not allow you to read it", and those two need
+ * different advice.
+ */
+async function probeReachable(origin, outerSignal, timeoutMs) {
+  const deadline = deadlineSignal(outerSignal, timeoutMs);
+  try {
+    await fetch(`${origin}${API_ECHO}?probe=${Date.now()}`, {
+      mode: "no-cors",
+      cache: "no-store",
+      credentials: "omit",
+      signal: deadline.signal,
+    });
+    return true;
+  } catch (err) {
+    return false;
+  } finally {
+    deadline.done();
+  }
+}
+
+/**
+ * Reachable is not enough: the run also has to be able to READ the answers.
+ *
+ * A cross-origin measurement needs `cors_allowed_origins` in Home Assistant's
+ * `http:` config to name the origin the dashboard is loaded from, and some
+ * browsers additionally gate a public page reaching a private address behind
+ * a permission. Both fail the same way from here, so this is checked
+ * separately from reachability and reported as its own sentence -- the fix is
+ * a line of configuration, and a card that silently fell back to the slow path
+ * would never say so.
+ */
+async function probeUsable(origin, hass, outerSignal, timeoutMs) {
+  const deadline = deadlineSignal(outerSignal, timeoutMs);
+  try {
+    const response = await fetch(`${origin}${API_ECHO}?probe=${Date.now()}`, {
+      cache: "no-store",
+      headers: authHeaders(hass),
+      signal: deadline.signal,
+    });
+    return response.ok || response.status === 204;
+  } catch (err) {
+    return false;
+  } finally {
+    deadline.done();
+  }
 }
 
 /**
@@ -546,6 +675,20 @@ const DEFAULTS = {
   cellular_max_mb: 64,
   report: true,
   internal_origins: [],
+  // Measure the path the Companion app would use rather than the one this tab
+  // happens to be open on -- see internalCandidates(). Inert unless
+  // `internal_origins` is set, so it changes nothing for an install that has
+  // not said where its LAN URLs are.
+  prefer_internal: true,
+  // The public URL, so a card loaded from the LAN can still offer to measure
+  // the internet path. Only needed for that direction: a page already loaded
+  // from outside can offer its own origin.
+  external_origin: "",
+  // How long to wait for an internal URL to answer before giving up on it.
+  // A LAN round trip is single-digit milliseconds; this is sized for a phone
+  // waking its radio, and it is also the cost added to every run made from
+  // outside the house, where the probe can only ever time out.
+  internal_probe_ms: 2000,
   client_name: "",
 };
 
@@ -564,10 +707,147 @@ function resolveConfig(config) {
   merged.max_upload_mb = clampInt(merged.max_upload_mb, DEFAULTS.max_upload_mb, 1, 128);
   merged.cellular_max_mb = clampInt(merged.cellular_max_mb, DEFAULTS.cellular_max_mb, 1, 512);
   merged.internal_origins = Array.isArray(merged.internal_origins) ? merged.internal_origins : [];
+  merged.prefer_internal = merged.prefer_internal !== false;
+  merged.external_origin = normaliseOrigin(merged.external_origin);
+  merged.internal_probe_ms = clampInt(merged.internal_probe_ms, DEFAULTS.internal_probe_ms, 200, 10000);
   return merged;
 }
 
 /* ------------------------------------------------------------ measurement */
+
+/**
+ * A latency source: something that can be pinged, and closed when done.
+ *
+ * Normally this is the websocket the dashboard already has open, which is the
+ * transport every state update and button press uses and therefore the number
+ * that describes how responsive the dashboard feels.
+ *
+ * IT CANNOT BE, THOUGH, WHEN THE RUN IS MEASURING A DIFFERENT ORIGIN. That
+ * socket is bound to the page, so pinging it while the transfers go over the
+ * LAN would put a Cloudflare round trip next to LAN throughput and present the
+ * pair as one result -- a number that is not wrong so much as not about
+ * anything. A run against another origin therefore opens its own websocket
+ * there, and says so if it cannot.
+ */
+function pagePinger(hass) {
+  return {
+    kind: "page",
+    ping: () => hass.connection.ping(),
+    close: () => {},
+  };
+}
+
+/**
+ * Open and authenticate a second websocket against `base`.
+ *
+ * Home Assistant's websocket API is a plain `auth_required` -> `auth` ->
+ * `auth_ok` handshake carrying the same bearer token the HTTP calls use, and
+ * `{type: "ping"}` -> `pong` is the same round trip `connection.ping()` makes.
+ * The handshake is not subject to CORS -- a websocket upgrade never is -- so
+ * this half works even where the HTTP half needs `cors_allowed_origins`.
+ */
+function openSocketPinger(base, hass, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const token = hass && hass.auth && hass.auth.accessToken;
+    if (!token) {
+      reject(new Error("no access token"));
+      return;
+    }
+    let socket;
+    try {
+      socket = new WebSocket(`${base.replace(/^http/i, "ws")}/api/websocket`);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    const pending = new Map();
+    let nextId = 1;
+    let settled = false;
+    const timer = setTimeout(() => finish(new Error("timed out")), timeoutMs);
+
+    const close = () => {
+      try {
+        socket.close();
+      } catch (err) {
+        /* already gone */
+      }
+    };
+    // One exit for every failure path. A socket that dies mid-run must reject
+    // the ping in flight, or the measurement loop waits for a pong that can
+    // never arrive and the card sits on "Measuring latency..." forever.
+    const fail = (err) => {
+      for (const waiter of pending.values()) waiter.fail(err);
+      pending.clear();
+    };
+    function finish(err) {
+      clearTimeout(timer);
+      fail(err);
+      if (settled) return;
+      settled = true;
+      close();
+      reject(err);
+    }
+
+    socket.addEventListener("message", (event) => {
+      let message;
+      try {
+        message = JSON.parse(event.data);
+      } catch (err) {
+        return;
+      }
+      if (message.type === "auth_required") {
+        socket.send(JSON.stringify({ type: "auth", access_token: token }));
+        return;
+      }
+      if (message.type === "auth_invalid") {
+        finish(new Error("authentication rejected"));
+        return;
+      }
+      if (message.type === "auth_ok" && !settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve({
+          kind: "direct",
+          ping: () =>
+            new Promise((ok, bad) => {
+              const id = nextId++;
+              // Per-ping deadline as well as the socket-level one: a link that
+              // stops answering without closing is exactly the fault this card
+              // is for, and it must show up as a failed run, not a hang.
+              const ping_timer = setTimeout(() => {
+                pending.delete(id);
+                bad(new Error("ping timed out"));
+              }, timeoutMs);
+              pending.set(id, {
+                ok: () => {
+                  clearTimeout(ping_timer);
+                  ok();
+                },
+                fail: (err) => {
+                  clearTimeout(ping_timer);
+                  bad(err);
+                },
+              });
+              socket.send(JSON.stringify({ id, type: "ping" }));
+            }),
+          close,
+        });
+        return;
+      }
+      if (message.type === "pong") {
+        const waiter = pending.get(message.id);
+        if (waiter) {
+          pending.delete(message.id);
+          waiter.ok();
+        }
+      }
+    });
+
+    socket.addEventListener("error", () => finish(new Error("websocket error")));
+    socket.addEventListener("close", () => finish(new Error("websocket closed")));
+  });
+}
 
 /**
  * Round-trip time over the websocket.
@@ -576,13 +856,13 @@ function resolveConfig(config) {
  * pays for whatever the connection had to wake up, which is real but is not
  * the steady-state latency the rest of the dashboard experiences.
  */
-async function measureLatency(hass, count, signal, onSample) {
+async function measureLatency(pinger, count, signal, onSample) {
   const warmup = 2;
   const samples = [];
   for (let i = 0; i < count + warmup; i++) {
     if (signal.aborted) break;
     const started = performance.now();
-    await hass.connection.ping();
+    await pinger.ping();
     const elapsed = performance.now() - started;
     if (i >= warmup) {
       samples.push(elapsed);
@@ -607,9 +887,9 @@ function authHeaders(hass) {
  * than failing it, because a missing label is worth far less than a missing
  * measurement.
  */
-async function fetchServerInfo(hass, signal) {
+async function fetchServerInfo(base, hass, signal) {
   try {
-    const response = await fetch(`${API_INFO}?t=${Date.now()}`, {
+    const response = await fetch(`${base}${API_INFO}?t=${Date.now()}`, {
       cache: "no-store",
       headers: authHeaders(hass),
       signal,
@@ -622,12 +902,12 @@ async function fetchServerInfo(hass, signal) {
   }
 }
 
-async function measureHttpLatency(hass, signal) {
+async function measureHttpLatency(base, hass, signal) {
   const samples = [];
   for (let i = 0; i < 5; i++) {
     if (signal.aborted) break;
     const started = performance.now();
-    const response = await fetch(`${API_ECHO}?t=${Date.now()}-${i}`, {
+    const response = await fetch(`${base}${API_ECHO}?t=${Date.now()}-${i}`, {
       cache: "no-store",
       headers: authHeaders(hass),
       signal,
@@ -658,12 +938,12 @@ async function drain(response, onChunk) {
   return received;
 }
 
-async function measureDownload(hass, bytes, streams, signal, onProgress) {
+async function measureDownload(base, hass, bytes, streams, signal, onProgress) {
   const perStream = Math.max(1, Math.floor(bytes / streams));
   const started = performance.now();
   const totals = await Promise.all(
     Array.from({ length: streams }, async (_, index) => {
-      const url = `${API_DOWNLOAD}?bytes=${perStream}&s=${index}&t=${Date.now()}`;
+      const url = `${base}${API_DOWNLOAD}?bytes=${perStream}&s=${index}&t=${Date.now()}`;
       const response = await fetch(url, { cache: "no-store", headers: authHeaders(hass), signal });
       if (!response.ok) throw new Error(`download returned HTTP ${response.status}`);
       return drain(response, onProgress);
@@ -694,10 +974,10 @@ function makeUploadBody(bytes, cryptoImpl) {
   return body;
 }
 
-async function measureUpload(hass, bytes, signal) {
+async function measureUpload(base, hass, bytes, signal) {
   const body = makeUploadBody(bytes, typeof crypto !== "undefined" ? crypto : null);
   const started = performance.now();
-  const response = await fetch(`${API_UPLOAD}?t=${Date.now()}`, {
+  const response = await fetch(`${base}${API_UPLOAD}?t=${Date.now()}`, {
     method: "POST",
     cache: "no-store",
     headers: { ...authHeaders(hass), "Content-Type": "application/octet-stream" },
@@ -720,6 +1000,15 @@ const CARD_CSS = `
   .ct-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
   .ct-title { font-size: 1.1rem; font-weight: 500; color: var(--primary-text-color); }
   .ct-context { font-size: 0.72rem; color: var(--secondary-text-color); word-break: break-all; margin-top: 2px; }
+  .ct-target { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; margin-top: 6px; font-size: 0.78rem; }
+  .ct-target-label { color: var(--secondary-text-color); }
+  .ct-target-host { font-weight: 500; color: var(--primary-text-color); word-break: break-all; }
+  .ct-link {
+    font: inherit; font-size: 0.75rem; cursor: pointer;
+    background: none; border: none; padding: 0; text-decoration: underline;
+    color: var(--primary-color);
+  }
+  .ct-link[hidden] { display: none; }
   .ct-ident { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
   .ct-device { font-size: 0.9rem; font-weight: 500; color: var(--primary-text-color); }
   .ct-chip {
@@ -778,6 +1067,10 @@ const CARD_CSS = `
   .ct-btn.ct-secondary { background: transparent; color: var(--primary-color); }
   .ct-btn[disabled] { opacity: 0.5; cursor: default; }
   .ct-warn { font-size: 0.72rem; color: var(--warning-color); margin-bottom: 8px; }
+  /* A switched run is not a fault, so it must not be painted as one -- but it
+     still has to be said, because the numbers then describe a path the address
+     bar does not show. */
+  .ct-warn[data-tone="info"] { color: var(--secondary-text-color); }
   .ct-warn[hidden] { display: none; }
 `;
 
@@ -798,6 +1091,16 @@ class ConnectionTestCard extends HTMLElement {
     // The server's last answer about this connection, so the identity block
     // keeps its verdict between runs instead of reverting to "unknown".
     this._info = null;
+    // Which origin the last run measured, and why. `base` is "" for the
+    // ordinary same-origin case and a full origin when the run was switched
+    // onto a LAN URL; every fetch prefixes it, so "" needs no special case.
+    this._target = { base: "", origin: "", note: "", scope: "unknown" };
+    // "auto" measures the LAN when it can be reached; "external" is the user
+    // asking for the internet path instead. Deliberately NOT persisted: it is
+    // a one-off comparison, and a measurement mode that quietly survived a
+    // reload would have every later run describing a path nobody chose.
+    this._targetChoice = "auto";
+    this._targetPromise = null;
   }
 
   setConfig(config) {
@@ -814,7 +1117,13 @@ class ConnectionTestCard extends HTMLElement {
    * the DOM many times a second and tear down a measurement in flight.
    */
   set hass(hass) {
+    const first = !this._hass;
     this._hass = hass;
+    // One probe, on the first hass we are given -- the shell is built before
+    // hass arrives, and the target row would otherwise sit blank until the
+    // first run. Nothing else happens here; re-rendering on a hass update is
+    // what rebuilds the DOM many times a second.
+    if (first && this._shellBuilt) this._resolveTargetOnce();
   }
 
   get hass() {
@@ -850,6 +1159,12 @@ class ConnectionTestCard extends HTMLElement {
         <span class="ct-chip" data-field="conn"></span>
       </div>
       <div class="ct-context"></div>
+      <div class="ct-target">
+        <span class="ct-target-label">Testing</span>
+        <span class="ct-target-host" data-field="target-host">&mdash;</span>
+        <span class="ct-chip" data-field="target-scope" hidden></span>
+        <button class="ct-link" data-action="switch-target" hidden></button>
+      </div>
       <div class="ct-rename" hidden>
         <input class="ct-input" type="text" maxlength="64" placeholder="Name this device" />
         <button class="ct-btn ct-secondary" data-action="rename-save">Save</button>
@@ -888,6 +1203,9 @@ class ConnectionTestCard extends HTMLElement {
       device: root.querySelector(".ct-device"),
       conn: root.querySelector('[data-field="conn"]'),
       context: root.querySelector(".ct-context"),
+      targetHost: root.querySelector('[data-field="target-host"]'),
+      targetScope: root.querySelector('[data-field="target-scope"]'),
+      targetSwitch: root.querySelector('[data-action="switch-target"]'),
       rename: root.querySelector(".ct-rename"),
       input: root.querySelector(".ct-input"),
       warn: root.querySelector(".ct-warn"),
@@ -916,6 +1234,7 @@ class ConnectionTestCard extends HTMLElement {
       if (what === "rename") this._openRename();
       if (what === "rename-save") this._saveRename();
       if (what === "rename-cancel") this._closeRename();
+      if (what === "switch-target") this._switchTarget();
     });
     this._nodes.input.addEventListener("keydown", (event) => {
       if (event.key === "Enter") this._saveRename();
@@ -923,7 +1242,11 @@ class ConnectionTestCard extends HTMLElement {
     });
 
     this._shellBuilt = true;
+    this._paintTarget();
     this._paintContext();
+    // hass usually arrives before setConfig, in which case the setter already
+    // fired and did nothing because the shell did not exist yet.
+    if (this._hass) this._resolveTargetOnce();
     // Chromium's high-entropy hints are the only source for an Android model
     // (see highEntropyHints), and they are async. Paint immediately from the
     // user agent, then repaint when the better answer lands.
@@ -952,6 +1275,168 @@ class ConnectionTestCard extends HTMLElement {
     return this._identifying;
   }
 
+  /**
+   * Decide which Home Assistant URL this run should measure.
+   *
+   * Two probes, because "did not work" has two causes needing two different
+   * sentences: the LAN URL is not reachable from here (ordinary -- you are
+   * out of the house), or it is reachable but the browser was not allowed to
+   * read the answer (a missing `cors_allowed_origins` entry, or a browser
+   * gating a public page's access to a private address).
+   *
+   * Either way the run continues on the current origin. A slower measurement
+   * of the real path beats no measurement, and the card says which it got.
+   */
+  async _resolveTarget(signal) {
+    const pageOrigin = normaliseOrigin(pageOriginOf(window));
+    const timeout = this._config.internal_probe_ms;
+    const here = (origin, note, extra) => ({
+      base: normaliseOrigin(origin) === pageOrigin ? "" : origin,
+      origin,
+      note: note || "",
+      scope: classifyPath(origin, this._config.internal_origins),
+      ...(extra || {}),
+    });
+
+    // Nothing to probe with until the connection exists; the hass setter runs
+    // this again the moment it does.
+    if (!this._hass) return here(pageOrigin, "");
+
+    // Asked for the internet path. From a page already loaded that way there
+    // is nothing to do; from a LAN page it means measuring another origin,
+    // which needs the same permission the other direction does.
+    if (this._targetChoice === "external") {
+      const external = externalTarget(pageOrigin, this._config);
+      if (!external || external === pageOrigin) return here(pageOrigin, "manual");
+      const verdict = await this._tryOrigin(external, signal, timeout);
+      if (verdict === "ok") return here(external, "manual");
+      return here(pageOrigin, verdict, { blocked: external });
+    }
+
+    const candidates = internalCandidates(pageOrigin, this._config);
+    if (!candidates.length) return here(pageOrigin, "");
+
+    for (const candidate of candidates) {
+      if (signal.aborted) break;
+      const verdict = await this._tryOrigin(candidate, signal, timeout);
+      if (verdict === "unreachable") continue;
+      if (verdict === "ok") return here(candidate, "switched");
+      // Reachable but unreadable. Name the first one that got this far and
+      // stop: a second candidate on the same server would fail identically.
+      return here(pageOrigin, "blocked", { blocked: candidate });
+    }
+    return here(pageOrigin, "");
+  }
+
+  /** "ok" | "blocked" (reachable, unreadable) | "unreachable". */
+  async _tryOrigin(origin, signal, timeout) {
+    if (!(await probeReachable(origin, signal, timeout))) return "unreachable";
+    return (await probeUsable(origin, this._hass, signal, timeout)) ? "ok" : "blocked";
+  }
+
+  /**
+   * Resolve the target once, and remember the promise rather than the answer.
+   *
+   * Cached as the promise so a run starting while the probe is still in
+   * flight waits for that lookup instead of firing a second one -- the same
+   * shape as _identify(). Dropped whenever the choice changes, and re-run at
+   * the start of every measurement, because a phone can move between networks
+   * between one run and the next.
+   */
+  _resolveTargetOnce(signal) {
+    if (!this._targetPromise) {
+      const controller = signal ? null : new AbortController();
+      this._targetPromise = this._resolveTarget(signal || controller.signal)
+        .catch(() => ({ base: "", origin: normaliseOrigin(pageOriginOf(window)), note: "", scope: "unknown" }))
+        .then((target) => {
+          this._target = target;
+          if (this._shellBuilt) this._paintTarget();
+          return target;
+        });
+    }
+    return this._targetPromise;
+  }
+
+  /**
+   * Flip between the LAN path and the internet path, in place.
+   *
+   * In place is the point: the card already offers a link that reloads the
+   * dashboard on the other hostname, and that costs the session -- every card
+   * on the page rebuilds, the websocket reconnects, and anything half-typed is
+   * gone. Only the measurement needs to move, so only the measurement moves.
+   */
+  _switchTarget() {
+    const alternative = this._targetAlternative();
+    if (!alternative) return;
+    // Keyed on what the button OFFERS, not on the current choice. Those two
+    // come apart the moment the card lands on the external path by itself --
+    // "auto" while measuring the internet is not the same state as "auto"
+    // while measuring the LAN, and toggling the choice would have sent the
+    // button labelled "use halan..." off to the external one.
+    this._targetChoice = alternative.choice;
+    this._targetPromise = null;
+    this._paintTarget();
+    this._resolveTargetOnce();
+  }
+
+  /**
+   * The other path, or null when there is not one worth offering.
+   *
+   * Going LAN -> internet is always available: the internet URL is either
+   * configured or is the one this page was loaded from.
+   *
+   * Coming back is only offered after a MANUAL switch. When the card chose the
+   * internet path itself it did so having just probed the LAN one, so a button
+   * promising it would fail the same way a second later -- an offer the card
+   * already knows it cannot keep.
+   */
+  _targetAlternative() {
+    const pageOrigin = normaliseOrigin(pageOriginOf(window));
+    const target = this._target || {};
+    const origin = target.origin || pageOrigin;
+    const scope = target.scope || classifyPath(origin, this._config.internal_origins);
+
+    if (scope === "internal") {
+      const external = externalTarget(pageOrigin, this._config);
+      return external && normaliseOrigin(external) !== normaliseOrigin(origin)
+        ? { choice: "external", origin: external }
+        : null;
+    }
+    if (this._targetChoice !== "external") return null;
+    const internal =
+      internalCandidates(pageOrigin, this._config)[0] ||
+      (classifyPath(pageOrigin, this._config.internal_origins) === "internal" ? pageOrigin : "");
+    return internal ? { choice: "auto", origin: internal } : null;
+  }
+
+  /**
+   * Name the host this run will measure, and offer the other one.
+   *
+   * The hostname is shown because it is the one thing about a result that a
+   * viewer cannot work out for themselves and that changes what every number
+   * on the card means.
+   */
+  _paintTarget() {
+    const nodes = this._nodes;
+    if (!nodes.targetHost) return;
+
+    const pageOrigin = normaliseOrigin(pageOriginOf(window));
+    const target = this._target || {};
+    const origin = target.origin || pageOrigin;
+    const scope = target.scope || classifyPath(origin, this._config.internal_origins);
+
+    nodes.targetHost.textContent = hostOf(origin) || "unknown";
+    const label = scope === "internal" ? "local network" : scope === "external" ? "internet" : "";
+    nodes.targetScope.textContent = label;
+    nodes.targetScope.hidden = !label;
+    if (label) nodes.targetScope.dataset.scope = scope === "internal" ? "local" : "remote";
+
+    // The other path, named by host so the button says where it goes.
+    const alternative = this._targetAlternative();
+    nodes.targetSwitch.hidden = !alternative;
+    nodes.targetSwitch.textContent = alternative ? `use ${hostOf(alternative.origin)}` : "";
+  }
+
   _openRename() {
     this._nodes.input.value = storedName(window) || this._nodes.device.textContent || "";
     this._nodes.rename.hidden = false;
@@ -977,11 +1462,15 @@ class ConnectionTestCard extends HTMLElement {
    * matching the origin against the configured `internal_origins`, which is a
    * guess about hostnames rather than an observation about addresses.
    */
-  _paintContext(info) {
+  _paintContext(info, target) {
     this._info = info || this._info || null;
     const served = this._info;
+    if (target) this._target = target;
 
-    const origin = (typeof window !== "undefined" && window.location && window.location.origin) || "";
+    const pageOrigin = normaliseOrigin(pageOriginOf(window));
+    // What the numbers are ABOUT, which is not always where the page came
+    // from -- everything below is labelled against the tested origin.
+    const origin = this._target.base || pageOrigin;
     const device = this._device || describeDevice(window, null);
     const network = readNetwork(window);
 
@@ -1009,11 +1498,15 @@ class ConnectionTestCard extends HTMLElement {
         : "remote";
 
     const ip = served && served.client_ip ? served.client_ip : "";
-    this._nodes.context.textContent = ip ? `${origin || "unknown origin"} — seen as ${ip}` : origin || "unknown origin";
+    const context = [ip ? `${origin || "unknown origin"} — seen as ${ip}` : origin || "unknown origin"];
+    if (this._target.base && this._target.base !== pageOrigin) {
+      context.push(`dashboard loaded from ${hostOf(pageOrigin)}`);
+    }
+    this._nodes.context.textContent = context.join(" · ");
 
     this._paintWarning(origin, path, served);
 
-    return { origin, path, name, device, network, connection, info: served };
+    return { origin, page_origin: pageOrigin, path, name, device, network, connection, info: served };
   }
 
   /**
@@ -1030,6 +1523,35 @@ class ConnectionTestCard extends HTMLElement {
   _paintWarning(origin, path, served) {
     const warn = this._nodes.warn;
     warn.textContent = "";
+    delete warn.dataset.tone;
+
+    // The run was moved onto a LAN URL. Not a fault, and the card must not
+    // dress it as one -- but it does have to say so, because the numbers now
+    // describe a different path from the one the address bar shows.
+    if (this._target.base) {
+      warn.dataset.tone = "info";
+      warn.textContent = `Measured over the local network (${hostOf(this._target.base)}); this dashboard itself is loaded from ${hostOf(pageOriginOf(window))}.`;
+      warn.hidden = false;
+      return;
+    }
+
+    // Reachable, but this page was not allowed to read the answer, so the run
+    // fell back to the origin it was loaded from. Say what to change: the
+    // alternative is a card that quietly measures the wrong path forever.
+    if (this._target.note === "blocked") {
+      warn.textContent = `${hostOf(this._target.blocked)} answered but would not let this page measure it — add ${pageOriginOf(window)} to cors_allowed_origins under http: in configuration.yaml (or allow this site to reach the local network).`;
+      warn.hidden = false;
+      return;
+    }
+
+    // Asked for an origin that is not answering from here at all. Only worth
+    // saying when it was asked for by hand: not reaching the LAN URL from a
+    // coffee shop is the ordinary case and needs no sentence.
+    if (this._target.note === "unreachable") {
+      warn.textContent = `${hostOf(this._target.blocked)} did not answer from this device, so the test used ${hostOf(pageOriginOf(window))} instead.`;
+      warn.hidden = false;
+      return;
+    }
 
     if (path === "internal") {
       warn.hidden = true;
@@ -1110,10 +1632,19 @@ class ConnectionTestCard extends HTMLElement {
     try {
       await this._identify();
 
+      /* ---- which URL is this run measuring? ---- */
+      // Re-probed rather than reused: a phone can leave the house between one
+      // run and the next, and a cached verdict would keep reporting the path
+      // it used to be on.
+      this._status("Choosing the path…");
+      this._targetPromise = null;
+      const target = await this._resolveTargetOnce(controller.signal);
+      const base = target.base;
+
       /* ---- what the server can see that we cannot ---- */
       this._status("Checking the connection…");
-      const info = await fetchServerInfo(hass, controller.signal);
-      const context = this._paintContext(info);
+      const info = await fetchServerInfo(base, hass, controller.signal);
+      const context = this._paintContext(info, target);
 
       // Ceilings, tightest wins: the card's own configuration, whatever the
       // server says this path will carry (Cloudflare's 100 MB, or the proxy's
@@ -1132,16 +1663,33 @@ class ConnectionTestCard extends HTMLElement {
 
       /* ---- latency (websocket) ---- */
       this._status("Measuring latency…");
-      const samples = await measureLatency(hass, config.ping_count, controller.signal, (taken) => {
-        this._progress((taken.length / config.ping_count) * 0.2);
-        const running = summariseLatency(taken);
-        this._nodes.latency.textContent = fmtMs(running.avg);
-      });
+      // A run measuring another origin pings THAT origin. Falling back to the
+      // page's own socket would report a Cloudflare round trip beside LAN
+      // throughput, so the fallback says so rather than passing silently.
+      let pinger = pagePinger(hass);
+      let latencyNote = "";
+      if (base) {
+        try {
+          pinger = await openSocketPinger(base, hass, 5000);
+        } catch (err) {
+          latencyNote = ` · latency over ${hostOf(pageOriginOf(window))}`;
+        }
+      }
+      let samples;
+      let httpLatency;
+      try {
+        samples = await measureLatency(pinger, config.ping_count, controller.signal, (taken) => {
+          this._progress((taken.length / config.ping_count) * 0.2);
+          const running = summariseLatency(taken);
+          this._nodes.latency.textContent = fmtMs(running.avg);
+        });
+        httpLatency = await measureHttpLatency(base, hass, controller.signal);
+      } finally {
+        pinger.close();
+      }
       const latency = summariseLatency(samples);
       this._nodes.latency.textContent = fmtMs(latency.avg);
-      this._nodes.latencyDetail.textContent = `min ${fmtMs(latency.min)} · p95 ${fmtMs(latency.p95)} · jitter ${fmtMs(latency.jitter)}`;
-
-      const httpLatency = await measureHttpLatency(hass, controller.signal);
+      this._nodes.latencyDetail.textContent = `min ${fmtMs(latency.min)} · p95 ${fmtMs(latency.p95)} · jitter ${fmtMs(latency.jitter)}${latencyNote}`;
 
       /* ---- download ---- */
       this._status("Measuring download…");
@@ -1149,7 +1697,7 @@ class ConnectionTestCard extends HTMLElement {
       // The probe doubles as connection warm-up: it opens (and TLS-handshakes)
       // the sockets the measured run then reuses via keep-alive, so setup cost
       // is not billed to the throughput figure.
-      const probe = await measureDownload(hass, minDown, 1, controller.signal, null);
+      const probe = await measureDownload(base, hass, minDown, 1, controller.signal, null);
       const downloadSize = nextSize(
         mbitsPerSecond(probe.bytes, probe.seconds),
         config.target_seconds,
@@ -1159,6 +1707,7 @@ class ConnectionTestCard extends HTMLElement {
 
       let downloaded = 0;
       const download = await measureDownload(
+        base,
         hass,
         downloadSize,
         config.download_streams,
@@ -1175,10 +1724,10 @@ class ConnectionTestCard extends HTMLElement {
       /* ---- upload ---- */
       this._status("Measuring upload…");
       const minUp = Math.min(config.min_upload_mb * MB, maxUp);
-      const upProbe = await measureUpload(hass, minUp, controller.signal);
+      const upProbe = await measureUpload(base, hass, minUp, controller.signal);
       const uploadSize = nextSize(mbitsPerSecond(upProbe.bytes, upProbe.seconds), config.target_seconds, minUp, maxUp);
       this._progress(0.75);
-      const upload = await measureUpload(hass, uploadSize, controller.signal);
+      const upload = await measureUpload(base, hass, uploadSize, controller.signal);
       const uploadMbps = mbitsPerSecond(upload.bytes, upload.seconds);
       this._nodes.upload.textContent = fmtRate(uploadMbps);
       this._nodes.uploadDetail.textContent = `${fmtBytes(upload.bytes)} in ${upload.seconds.toFixed(1)}s${capNote}`;
@@ -1192,7 +1741,11 @@ class ConnectionTestCard extends HTMLElement {
           client_id: clientId(window),
           client_name: context.name,
           platform: device.platform,
+          // The origin the run MEASURED, which is not always the one the
+          // dashboard was loaded from -- `page_origin` keeps that distinction
+          // in the sensor rather than only on screen.
           origin: context.origin,
+          page_origin: context.page_origin,
           path: context.path,
           user: (hass.user && hass.user.name) || "",
           user_agent: (window.navigator && window.navigator.userAgent) || "",
@@ -1265,6 +1818,10 @@ if (typeof module !== "undefined" && module.exports) {
     hostOf,
     isPrivateHost,
     classifyPath,
+    normaliseOrigin,
+    pageOriginOf,
+    internalCandidates,
+    externalTarget,
     detectPlatform,
     describeDevice,
     deviceLabel,

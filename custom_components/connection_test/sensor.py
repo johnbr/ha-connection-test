@@ -208,6 +208,7 @@ class ConnectionTestSensor(SensorEntity):
             "client_id": run.get("client_id"),
             "platform": run.get("platform"),
             "origin": run.get("origin"),
+            "page_origin": run.get("page_origin"),
             "path": run.get("path"),
             "connection": run.get("connection"),
             "device_model": device.get("model"),

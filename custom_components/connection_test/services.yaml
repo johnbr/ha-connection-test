@@ -26,6 +26,10 @@ report:
       example: "https://ha.example.net"
       selector:
         text:
+    page_origin:
+      example: "https://ha.example.net"
+      selector:
+        text:
     path:
       example: "external"
       selector:

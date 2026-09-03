@@ -45,7 +45,11 @@
         },
         "origin": {
           "name": "Origin",
-          "description": "The URL the client reached Home Assistant on. Which one was used changes what the result means."
+          "description": "The URL the run measured. Which one was used changes what the result means."
+        },
+        "page_origin": {
+          "name": "Page origin",
+          "description": "The URL the dashboard itself was loaded from, when the run measured a different one."
         },
         "path": {
           "name": "Path",

@@ -349,6 +349,9 @@ def normalise_report(payload: Mapping[str, Any], *, timestamp: str) -> dict[str,
         "client": _clean_text(payload.get("client_name"), 64) or client_id,
         "platform": _vocabulary(payload.get("platform"), PLATFORMS_CLIENT, "unknown"),
         "origin": _clean_text(payload.get("origin"), 128),
+        # Where the dashboard was loaded from, which is not always what was
+        # measured -- see the report schema.
+        "page_origin": _clean_text(payload.get("page_origin"), 128),
         "path": path,
         "connection": connection,
         "device": _device(payload),

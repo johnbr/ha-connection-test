@@ -70,7 +70,12 @@ REPORT_SCHEMA = vol.Schema(
         vol.Required("client_id"): cv.string,
         vol.Required("client_name"): cv.string,
         vol.Optional("platform"): cv.string,
+        # `origin` is the URL the run MEASURED and `page_origin` the one the
+        # dashboard was loaded from. They differ whenever the card switched a
+        # run onto the LAN path, and the pair is the only thing that explains
+        # a result taken from a hostname nobody typed.
         vol.Optional("origin"): cv.string,
+        vol.Optional("page_origin"): cv.string,
         vol.Optional("path"): cv.string,
         vol.Optional("user"): cv.string,
         vol.Optional("user_agent"): cv.string,

@@ -59,6 +59,9 @@ client_name:
 internal_origins: # see "Which URL am I on?" below
   - https://homeassistant.local:8123
   - http://192.168.1.10:8123
+external_origin: https://ha.example.net # the public URL, for the switch
+prefer_internal: true # measure the LAN when it can be reached
+internal_probe_ms: 2000 # how long to wait for a LAN URL, 200-10000
 ping_count: 20 # 3–100
 target_seconds: 8 # aim each transfer at this duration, 1–30
 download_streams: 4 # parallel connections, 1–8
@@ -123,6 +126,52 @@ An `external` run measures the whole path, including your reverse proxy, any CDN
 in front of it, and the internet. That is a legitimate and useful thing to know;
 it is just not the same measurement as the LAN one, so the card says so on screen.
 
+### Which URL gets measured
+
+The card names it, under the device: **Testing halan.example.net · local
+network**, with a link to measure the other one instead.
+
+With `internal_origins` set, a run **measures the path the Companion app would
+use**, not the one the tab happens to be open on. The app switches between an
+internal and an external URL by SSID; a browser does not, so a phone on the
+house Wi-Fi with the public URL open sends every request out to the internet and
+back — and without this the card would report that round trip as if it were the
+connection to Home Assistant.
+
+So before each run the card probes the LAN URLs and measures the first one that
+answers. It only ever switches that one way: a page loaded _from_ a LAN URL is
+on the LAN already, by construction.
+
+The **use &lt;host&gt;** link switches paths **in place** — nothing reloads, the
+websocket stays up, and the choice lasts until the dashboard is next loaded. It
+is deliberately not remembered: it is a one-off comparison, and a measurement
+mode that survived a reload would leave later runs describing a path nobody
+chose.
+
+Two things are needed for a cross-origin run, and the card names either one on
+screen when it is missing rather than quietly measuring the slow path:
+
+```yaml
+# configuration.yaml — each origin needs to allow the OTHER one
+http:
+  cors_allowed_origins:
+    - https://halan.example.net
+    - https://ha.example.net
+```
+
+and, in some browsers, permission for a public page to reach a private address.
+Where either is refused the run falls back to the origin the page was loaded
+from and says why.
+
+Latency follows the target. A run measuring another origin opens its own
+websocket there rather than pinging the page's — putting a Cloudflare round trip
+next to LAN throughput would produce a pair of numbers that is not about
+anything. If that socket cannot be opened the run continues and the latency
+detail line says which host it came from.
+
+Turn the whole thing off with `prefer_internal: false`; it is inert anyway
+unless `internal_origins` is set.
+
 ### Which network am I on?
 
 Each run also records a connection type — `local_wifi`, `local_wired`, `local`,
@@ -155,9 +204,12 @@ One device, four sensors:
 | `sensor.connection_test_last_run` | Timestamp of the most recent run; a `clients` attribute holds the latest result **per device** |
 
 Every sensor also carries the context its reading was taken in — `client`,
-`connection`, `path`, `origin`, `device_model`, `device_os`, `device_browser`,
-`client_ip` and `via_cloudflare` — because a throughput figure without it is not
-interpretable: 40 Mbit/s is a poor LAN result and a good cellular one.
+`connection`, `path`, `origin`, `page_origin`, `device_model`, `device_os`,
+`device_browser`, `client_ip` and `via_cloudflare` — because a throughput figure
+without it is not interpretable: 40 Mbit/s is a poor LAN result and a good
+cellular one. `origin` is the URL that was **measured** and `page_origin` the
+one the dashboard was loaded from; they differ whenever a run was switched onto
+the LAN path.
 
 <!-- prettier-ignore -->
 > **They report the most recent run from any client.** Home Assistant state is

@@ -35,6 +35,10 @@ const {
   hostOf,
   isPrivateHost,
   classifyPath,
+  normaliseOrigin,
+  pageOriginOf,
+  internalCandidates,
+  externalTarget,
   detectPlatform,
   describeDevice,
   deviceLabel,
@@ -176,6 +180,84 @@ test("classifyPath says unknown rather than guessing wrong", () => {
 });
 
 /* ------------------------------------------------------------- client id */
+
+/* ----------------------------------------------------------------- target */
+/*
+ * Which URL a run measures. The decision is pure and the probes are not, so
+ * everything decidable without a network is decided here.
+ */
+
+test("normaliseOrigin makes two spellings of one origin comparable", () => {
+  assert.equal(normaliseOrigin("https://HALAN.prowlah.net/"), "https://halan.prowlah.net");
+  assert.equal(normaliseOrigin("https://halan.prowlah.net///"), "https://halan.prowlah.net");
+  assert.equal(normaliseOrigin(undefined), "");
+});
+
+test("internalCandidates offers the LAN URLs when the page is on the external one", () => {
+  const config = {
+    prefer_internal: true,
+    internal_origins: ["https://halan.prowlah.net", "http://172.31.0.3:8123"],
+  };
+  assert.deepEqual(internalCandidates("https://ha.prowlah.net", config), [
+    "https://halan.prowlah.net",
+    "http://172.31.0.3:8123",
+  ]);
+});
+
+test("internalCandidates has nothing to offer a page already on a LAN URL", () => {
+  // The page could not have loaded otherwise, so there is nothing to probe --
+  // and a trailing slash must not be able to hide that.
+  const config = { prefer_internal: true, internal_origins: ["https://halan.prowlah.net"] };
+  assert.deepEqual(internalCandidates("https://halan.prowlah.net", config), []);
+  assert.deepEqual(internalCandidates("https://HALAN.prowlah.net/", config), []);
+});
+
+test("internalCandidates stays inert without configuration or consent", () => {
+  assert.deepEqual(internalCandidates("https://ha.prowlah.net", { prefer_internal: true, internal_origins: [] }), []);
+  assert.deepEqual(
+    internalCandidates("https://ha.prowlah.net", {
+      prefer_internal: false,
+      internal_origins: ["https://halan.prowlah.net"],
+    }),
+    []
+  );
+});
+
+test("externalTarget names the internet path from either side", () => {
+  const internal = ["https://halan.prowlah.net"];
+  // Configured: the only way a LAN-loaded page can name the public URL.
+  assert.equal(
+    externalTarget("https://halan.prowlah.net", {
+      internal_origins: internal,
+      external_origin: "https://ha.prowlah.net",
+    }),
+    "https://ha.prowlah.net"
+  );
+  // Unconfigured: a page loaded from outside already is the external path.
+  assert.equal(
+    externalTarget("https://ha.prowlah.net", { internal_origins: internal, external_origin: "" }),
+    "https://ha.prowlah.net"
+  );
+  // Unconfigured on a LAN page: nothing to offer, and it must not offer the
+  // LAN URL back as if it were the internet one.
+  assert.equal(externalTarget("https://halan.prowlah.net", { internal_origins: internal, external_origin: "" }), "");
+});
+
+test("resolveConfig defaults to preferring the LAN and clamps the probe", () => {
+  const defaults = resolveConfig({});
+  assert.equal(defaults.prefer_internal, true);
+  assert.equal(defaults.internal_probe_ms, 2000);
+  assert.equal(resolveConfig({ prefer_internal: false }).prefer_internal, false);
+  assert.equal(resolveConfig({ internal_probe_ms: 0 }).internal_probe_ms, 200);
+  assert.equal(resolveConfig({ internal_probe_ms: 99999 }).internal_probe_ms, 10000);
+  assert.equal(resolveConfig({ external_origin: "https://HA.prowlah.net/" }).external_origin, "https://ha.prowlah.net");
+});
+
+test("pageOriginOf tolerates a window without a location", () => {
+  assert.equal(pageOriginOf(null), "");
+  assert.equal(pageOriginOf({}), "");
+  assert.equal(pageOriginOf({ location: { origin: "https://ha.prowlah.net" } }), "https://ha.prowlah.net");
+});
 
 test("detectPlatform keys on the Companion bridge, not the user agent", () => {
   assert.strictEqual(detectPlatform({ externalApp: {}, document: {} }), "android_app");
