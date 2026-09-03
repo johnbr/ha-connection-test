@@ -55,6 +55,7 @@ const {
   resolveConfig,
   makeUploadBody,
   DEFAULTS,
+  ConnectionTestCard,
 } = card;
 
 // Shared with tests/test_measure.py — keep the two in step.
@@ -180,6 +181,137 @@ test("classifyPath says unknown rather than guessing wrong", () => {
 });
 
 /* ------------------------------------------------------------- client id */
+
+/* ---------------------------------------------------------- target choice */
+/*
+ * Which URL a run measures, driven through the real methods against a stub.
+ * These are not pure -- they probe -- so `fetch` is replaced with a fake
+ * network whose only knowledge is which hosts answer and which allow a
+ * cross-origin read. Nothing here touches the DOM.
+ */
+
+const CONFIG = {
+  internal_origins: ["https://halan.prowlah.net"],
+  external_origin: "https://ha.prowlah.net",
+  prefer_internal: true,
+  internal_probe_ms: 50,
+};
+
+/**
+ * @param reachable  hosts that answer at all (an opaque no-cors fetch resolves)
+ * @param readable   hosts that also allow this page to read the answer
+ */
+function fakeNetwork({ reachable = [], readable = [] } = {}) {
+  const calls = [];
+  global.fetch = async (url, options = {}) => {
+    calls.push({ url, mode: options.mode });
+    const host = String(url).split("/api/")[0];
+    if (!reachable.includes(host)) throw new TypeError("Failed to fetch");
+    // no-cors resolves opaquely even for a 401 -- that is the whole point of
+    // using it as the reachability probe.
+    if (options.mode === "no-cors") return { ok: false, status: 0, type: "opaque" };
+    if (!readable.includes(host)) throw new TypeError("CORS refused");
+    return { ok: true, status: 204 };
+  };
+  return calls;
+}
+
+function stubCard(pageOrigin, config = CONFIG) {
+  global.window = { location: { origin: pageOrigin } };
+  const stub = Object.create(ConnectionTestCard.prototype);
+  stub._config = resolveConfig({ ...config });
+  stub._hass = { auth: { accessToken: "token" } };
+  stub._target = { base: "", origin: "", note: "", scope: "unknown" };
+  stub._targetChoice = "auto";
+  stub._targetPromise = null;
+  stub._shellBuilt = false;
+  stub._nodes = {};
+  return stub;
+}
+
+const signal = () => new AbortController().signal;
+
+test("a LAN page measures itself, and probes nothing", async () => {
+  const calls = fakeNetwork({ reachable: [], readable: [] });
+  const stub = stubCard("https://halan.prowlah.net");
+  const target = await stub._resolveTarget(signal());
+  assert.equal(target.base, "");
+  assert.equal(target.scope, "internal");
+  assert.equal(calls.length, 0);
+});
+
+test("an external page switches onto the LAN URL when it answers", async () => {
+  fakeNetwork({ reachable: ["https://halan.prowlah.net"], readable: ["https://halan.prowlah.net"] });
+  const stub = stubCard("https://ha.prowlah.net");
+  const target = await stub._resolveTarget(signal());
+  assert.equal(target.base, "https://halan.prowlah.net");
+  assert.equal(target.note, "switched");
+  assert.equal(target.scope, "internal");
+});
+
+test("out of the house it stays put, silently", async () => {
+  // Nothing answers. This is the ordinary case and must not produce a warning
+  // note, or the card would complain every time it leaves the building.
+  fakeNetwork({ reachable: [], readable: [] });
+  const stub = stubCard("https://ha.prowlah.net");
+  const target = await stub._resolveTarget(signal());
+  assert.equal(target.base, "");
+  assert.equal(target.note, "");
+});
+
+test("reachable but unreadable is reported, not silently ignored", async () => {
+  // The missing cors_allowed_origins case: answering, but this page may not
+  // read it. Falling back is right; falling back quietly is not.
+  fakeNetwork({ reachable: ["https://halan.prowlah.net"], readable: [] });
+  const stub = stubCard("https://ha.prowlah.net");
+  const target = await stub._resolveTarget(signal());
+  assert.equal(target.base, "");
+  assert.equal(target.note, "blocked");
+  assert.equal(target.blocked, "https://halan.prowlah.net");
+});
+
+test("the probe is opaque first, authenticated second", async () => {
+  const calls = fakeNetwork({ reachable: ["https://halan.prowlah.net"], readable: ["https://halan.prowlah.net"] });
+  await stubCard("https://ha.prowlah.net")._resolveTarget(signal());
+  assert.equal(calls[0].mode, "no-cors");
+  assert.equal(calls[1].mode, undefined);
+});
+
+test("asking for the internet path measures it from a LAN page", async () => {
+  fakeNetwork({ reachable: ["https://ha.prowlah.net"], readable: ["https://ha.prowlah.net"] });
+  const stub = stubCard("https://halan.prowlah.net");
+  stub._targetChoice = "external";
+  const target = await stub._resolveTarget(signal());
+  assert.equal(target.base, "https://ha.prowlah.net");
+  assert.equal(target.scope, "external");
+});
+
+test("the switch goes where its label says, not wherever the toggle lands", async () => {
+  // The bug this exists for: the card lands on the external path by itself
+  // (LAN unreachable), so the button offers the LAN one back -- and a toggle
+  // keyed on the CURRENT CHOICE would have sent it to external instead.
+  const stub = stubCard("https://ha.prowlah.net");
+  stub._target = { base: "", origin: "https://ha.prowlah.net", note: "", scope: "external" };
+
+  // Auto already tried the LAN and could not reach it: nothing to offer.
+  stub._targetChoice = "auto";
+  assert.equal(stub._targetAlternative(), null);
+
+  // Manually on the internet path: offer the way back, and say so by host.
+  stub._targetChoice = "external";
+  assert.deepEqual(stub._targetAlternative(), { choice: "auto", origin: "https://halan.prowlah.net" });
+
+  // On the LAN: offer the internet path.
+  stub._target = { base: "https://halan.prowlah.net", origin: "https://halan.prowlah.net", scope: "internal" };
+  stub._targetChoice = "auto";
+  assert.deepEqual(stub._targetAlternative(), { choice: "external", origin: "https://ha.prowlah.net" });
+});
+
+test("with no external_origin a LAN-loaded card has nothing to offer", async () => {
+  const stub = stubCard("https://halan.prowlah.net", { ...CONFIG, external_origin: "" });
+  stub._target = { base: "", origin: "https://halan.prowlah.net", scope: "internal" };
+  assert.equal(stub._targetAlternative(), null);
+});
 
 /* ----------------------------------------------------------------- target */
 /*

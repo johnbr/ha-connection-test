@@ -1838,5 +1838,10 @@ if (typeof module !== "undefined" && module.exports) {
     resolveConfig,
     makeUploadBody,
     DEFAULTS,
+    // The class itself, so the target-choosing methods can be driven against
+    // a stub. They decide what gets measured, they are not pure, and the one
+    // real bug in them (a button that offered one path and switched to the
+    // other) was invisible to every pure test above.
+    ConnectionTestCard,
   };
 }
