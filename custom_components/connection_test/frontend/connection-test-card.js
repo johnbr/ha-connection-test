@@ -214,6 +214,83 @@ function internalCandidates(pageOrigin, config) {
 }
 
 /**
+ * What the note under the header should say, or null for nothing to say.
+ *
+ * PURE, AND SEPARATE FROM THE PAINTING, because the note and the "Testing
+ * <host>" row above it must never contradict each other and that is not
+ * something the DOM half can be tested for. It shipped contradicting: the note
+ * was painted once from the page's hostname, before the probe had run, and
+ * nothing repainted it when the run moved onto the LAN -- so a card correctly
+ * reporting `Testing halan... - local network` sat above "this run goes out to
+ * the internet and back". Everything here keys on the TARGET, so the two
+ * cannot come apart again.
+ *
+ * Tense matters too: this is on screen before anything has been measured, so
+ * it says what the test WILL do, not what it did.
+ */
+function describeWarning({ target, path, served, config, pageOrigin }) {
+  const here = hostOf(pageOrigin);
+  const chosen = target || {};
+
+  // Running against another origin. Not a fault, and it must not be dressed as
+  // one -- but it has to be said, because the numbers then describe a path the
+  // address bar does not show.
+  if (chosen.base) {
+    const scope = chosen.scope === "internal" ? "over the local network" : "out to the internet and back";
+    return {
+      tone: "info",
+      text: `This test runs ${scope} (${hostOf(chosen.base)}); the dashboard itself is loaded from ${here}.`,
+    };
+  }
+
+  // Reachable, but this page may not read the answer, so the test fell back to
+  // the origin it was loaded from. Say what to change -- and offer the link,
+  // because LOADING the dashboard from that host makes the measurement
+  // same-origin and needs no CORS at all.
+  if (chosen.note === "blocked") {
+    return {
+      text: `${hostOf(chosen.blocked)} answered but would not let this page measure it — add ${pageOrigin} to cors_allowed_origins in Home Assistant's HTTP config (or allow this site to reach the local network).`,
+      link: chosen.blocked,
+    };
+  }
+
+  if (chosen.note === "unreachable") {
+    return { text: `${hostOf(chosen.blocked)} did not answer from this device, so the test uses ${here} instead.` };
+  }
+
+  if (path === "internal") return null;
+
+  if (path === "unknown") {
+    // Only a complaint once the server has actually been asked and could not
+    // say. Before the first run there is nothing to report yet, and a warning
+    // on a card nobody has pressed reads as a fault.
+    return served
+      ? {
+          text: "Could not tell whether this connection is local or remote — the proxy in front of Home Assistant is not passing the client address on.",
+        }
+      : null;
+  }
+
+  const note = {
+    text:
+      served && served.via_cloudflare
+        ? "This test goes out to the internet and back through Cloudflare, which also caps the upload at 100 MB."
+        : "This test goes out to the internet and back, so it measures that path rather than the local network.",
+  };
+
+  // The "open it on the LAN host instead" link, ONLY where it has not already
+  // been tried. With prefer_internal on, a LAN URL that is not being used is
+  // one this card just failed to reach -- offering to navigate there would be
+  // promising something it has already watched fail.
+  if (!internalCandidates(pageOrigin, config).length) {
+    const configured = (config.internal_origins || []).map(normaliseOrigin).filter(Boolean);
+    const other = configured.find((candidate) => candidate !== normaliseOrigin(chosen.origin || pageOrigin));
+    if (other) note.link = other;
+  }
+  return note;
+}
+
+/**
  * An AbortSignal that gives up on its own after `ms`, and follows `outer`.
  *
  * `AbortSignal.any`/`AbortSignal.timeout` would be the modern spelling; this
@@ -1350,7 +1427,13 @@ class ConnectionTestCard extends HTMLElement {
         .catch(() => ({ base: "", origin: normaliseOrigin(pageOriginOf(window)), note: "", scope: "unknown" }))
         .then((target) => {
           this._target = target;
-          if (this._shellBuilt) this._paintTarget();
+          if (this._shellBuilt) {
+            this._paintTarget();
+            // The note has to move with the row. Painting only the row is what
+            // left "Testing halan... - local network" sitting above "this run
+            // goes out to the internet and back".
+            this._paintContext(this._info);
+          }
           return target;
         });
     }
@@ -1525,66 +1608,26 @@ class ConnectionTestCard extends HTMLElement {
     warn.textContent = "";
     delete warn.dataset.tone;
 
-    // The run was moved onto a LAN URL. Not a fault, and the card must not
-    // dress it as one -- but it does have to say so, because the numbers now
-    // describe a different path from the one the address bar shows.
-    if (this._target.base) {
-      warn.dataset.tone = "info";
-      warn.textContent = `Measured over the local network (${hostOf(this._target.base)}); this dashboard itself is loaded from ${hostOf(pageOriginOf(window))}.`;
-      warn.hidden = false;
-      return;
-    }
-
-    // Reachable, but this page was not allowed to read the answer, so the run
-    // fell back to the origin it was loaded from. Say what to change: the
-    // alternative is a card that quietly measures the wrong path forever.
-    if (this._target.note === "blocked") {
-      warn.textContent = `${hostOf(this._target.blocked)} answered but would not let this page measure it — add ${pageOriginOf(window)} to cors_allowed_origins under http: in configuration.yaml (or allow this site to reach the local network).`;
-      warn.hidden = false;
-      return;
-    }
-
-    // Asked for an origin that is not answering from here at all. Only worth
-    // saying when it was asked for by hand: not reaching the LAN URL from a
-    // coffee shop is the ordinary case and needs no sentence.
-    if (this._target.note === "unreachable") {
-      warn.textContent = `${hostOf(this._target.blocked)} did not answer from this device, so the test used ${hostOf(pageOriginOf(window))} instead.`;
-      warn.hidden = false;
-      return;
-    }
-
-    if (path === "internal") {
+    const note = describeWarning({
+      target: this._target,
+      path,
+      served,
+      config: this._config,
+      pageOrigin: normaliseOrigin(pageOriginOf(window)),
+    });
+    if (!note) {
       warn.hidden = true;
       return;
     }
 
-    if (path === "unknown") {
-      // Only a complaint once the server has actually been asked and could not
-      // say. Before the first run there is simply nothing to report yet, and a
-      // warning on a card nobody has pressed reads as a fault.
-      warn.hidden = !served;
-      if (served) {
-        warn.textContent =
-          "Could not tell whether this connection is local or remote — the proxy in front of Home Assistant is not passing the client address on.";
-      }
-      return;
-    }
-
-    const cloudflare = served && served.via_cloudflare;
-    warn.textContent = cloudflare
-      ? "This run goes out to the internet and back through Cloudflare, which also caps the upload at 100 MB."
-      : "This run goes out to the internet and back, so it measures that path rather than the local network.";
-
-    // Only offer an origin that is configured AND is not the one already in
-    // use; the link keeps the current dashboard path so it lands on this card.
-    const alternatives = (this._config.internal_origins || []).filter(
-      (candidate) => String(candidate).replace(/\/+$/, "").toLowerCase() !== String(origin).toLowerCase()
-    );
-    if (alternatives.length) {
+    if (note.tone) warn.dataset.tone = note.tone;
+    warn.textContent = note.text;
+    if (note.link) {
+      // Keeps the current dashboard path, so it lands back on this card.
       const link = document.createElement("a");
       link.className = "ct-switch";
-      link.href = `${String(alternatives[0]).replace(/\/+$/, "")}${window.location.pathname}${window.location.search}`;
-      link.textContent = `Open on ${hostOf(alternatives[0])}`;
+      link.href = `${note.link}${window.location.pathname}${window.location.search}`;
+      link.textContent = `Open on ${hostOf(note.link)}`;
       warn.appendChild(document.createTextNode(" "));
       warn.appendChild(link);
     }
@@ -1836,6 +1879,7 @@ if (typeof module !== "undefined" && module.exports) {
     fmtMs,
     fmtBytes,
     resolveConfig,
+    describeWarning,
     makeUploadBody,
     DEFAULTS,
     // The class itself, so the target-choosing methods can be driven against

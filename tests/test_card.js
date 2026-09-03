@@ -53,6 +53,7 @@ const {
   fmtMs,
   fmtBytes,
   resolveConfig,
+  describeWarning,
   makeUploadBody,
   DEFAULTS,
   ConnectionTestCard,
@@ -182,6 +183,115 @@ test("classifyPath says unknown rather than guessing wrong", () => {
 
 /* ------------------------------------------------------------- client id */
 
+/* ------------------------------------------------------------------ note */
+/*
+ * The note under the header must never contradict the "Testing <host>" row
+ * above it. It did: painted once from the page's hostname before the probe had
+ * run, and never repainted when the run moved onto the LAN.
+ */
+
+const NOTE_CONFIG = {
+  internal_origins: ["https://halan.prowlah.net"],
+  external_origin: "https://ha.prowlah.net",
+  prefer_internal: true,
+};
+
+test("a run switched onto the LAN never claims to go out to the internet", () => {
+  const note = describeWarning({
+    target: { base: "https://halan.prowlah.net", origin: "https://halan.prowlah.net", scope: "internal" },
+    // Deliberately the pre-run fallback verdict, which is what was on screen
+    // when this went wrong: the note must key on the TARGET, not on `path`.
+    path: "external",
+    served: null,
+    config: resolveConfig(NOTE_CONFIG),
+    pageOrigin: "https://ha.prowlah.net",
+  });
+  assert.equal(note.tone, "info");
+  assert.match(note.text, /over the local network \(halan\.prowlah\.net\)/);
+  assert.doesNotMatch(note.text, /out to the internet/);
+  assert.equal(note.link, undefined);
+});
+
+test("the note says what the test will do, not what it did", () => {
+  // It is on screen before the button has ever been pressed.
+  const onLan = describeWarning({
+    target: { base: "https://halan.prowlah.net", scope: "internal" },
+    path: "internal",
+    served: null,
+    config: resolveConfig(NOTE_CONFIG),
+    pageOrigin: "https://ha.prowlah.net",
+  });
+  assert.match(onLan.text, /^This test runs /);
+  const outside = describeWarning({
+    target: { base: "", origin: "https://ha.prowlah.net", note: "" },
+    path: "external",
+    served: null,
+    config: resolveConfig({ ...NOTE_CONFIG, prefer_internal: false }),
+    pageOrigin: "https://ha.prowlah.net",
+  });
+  assert.match(outside.text, /^This test goes out to the internet/);
+});
+
+test("a LAN run on a LAN page says nothing at all", () => {
+  assert.equal(
+    describeWarning({
+      target: { base: "", origin: "https://halan.prowlah.net", note: "", scope: "internal" },
+      path: "internal",
+      served: null,
+      config: resolveConfig(NOTE_CONFIG),
+      pageOrigin: "https://halan.prowlah.net",
+    }),
+    null
+  );
+});
+
+test("the Open-on link is dropped where the card already failed to reach it", () => {
+  // prefer_internal on: the LAN URL is not in use because the probe could not
+  // reach it, so offering to navigate there promises a failure.
+  const probed = describeWarning({
+    target: { base: "", origin: "https://ha.prowlah.net", note: "" },
+    path: "external",
+    served: null,
+    config: resolveConfig(NOTE_CONFIG),
+    pageOrigin: "https://ha.prowlah.net",
+  });
+  assert.equal(probed.link, undefined);
+
+  // prefer_internal off: nothing was tried, so the link is the only affordance.
+  const unprobed = describeWarning({
+    target: { base: "", origin: "https://ha.prowlah.net", note: "" },
+    path: "external",
+    served: null,
+    config: resolveConfig({ ...NOTE_CONFIG, prefer_internal: false }),
+    pageOrigin: "https://ha.prowlah.net",
+  });
+  assert.equal(unprobed.link, "https://halan.prowlah.net");
+});
+
+test("blocked keeps the link, because loading there needs no CORS at all", () => {
+  const note = describeWarning({
+    target: { base: "", origin: "https://ha.prowlah.net", note: "blocked", blocked: "https://halan.prowlah.net" },
+    path: "external",
+    served: null,
+    config: resolveConfig(NOTE_CONFIG),
+    pageOrigin: "https://ha.prowlah.net",
+  });
+  assert.match(note.text, /cors_allowed_origins/);
+  assert.equal(note.link, "https://halan.prowlah.net");
+});
+
+test("a manual switch to the internet path is described as such", () => {
+  const note = describeWarning({
+    target: { base: "https://ha.prowlah.net", origin: "https://ha.prowlah.net", scope: "external", note: "manual" },
+    path: "internal",
+    served: null,
+    config: resolveConfig(NOTE_CONFIG),
+    pageOrigin: "https://halan.prowlah.net",
+  });
+  assert.match(note.text, /out to the internet and back \(ha\.prowlah\.net\)/);
+  assert.equal(note.tone, "info");
+});
+
 /* ---------------------------------------------------------- target choice */
 /*
  * Which URL a run measures, driven through the real methods against a stub.
@@ -305,6 +415,24 @@ test("the switch goes where its label says, not wherever the toggle lands", asyn
   stub._target = { base: "https://halan.prowlah.net", origin: "https://halan.prowlah.net", scope: "internal" };
   stub._targetChoice = "auto";
   assert.deepEqual(stub._targetAlternative(), { choice: "external", origin: "https://ha.prowlah.net" });
+});
+
+test("resolving the target repaints the note, not only the row", async () => {
+  // The actual reported bug, and the only part of it a test can hold: the row
+  // was repainted when the probe landed and the note was not, so a card
+  // correctly reading `Testing halan... - local network` sat above "this run
+  // goes out to the internet and back" until a run rewrote it.
+  fakeNetwork({ reachable: ["https://halan.prowlah.net"], readable: ["https://halan.prowlah.net"] });
+  const stub = stubCard("https://ha.prowlah.net");
+  stub._shellBuilt = true;
+  const painted = [];
+  stub._paintTarget = () => painted.push("row");
+  stub._paintContext = () => painted.push("note");
+
+  const target = await stub._resolveTargetOnce();
+
+  assert.equal(target.base, "https://halan.prowlah.net");
+  assert.deepEqual(painted, ["row", "note"]);
 });
 
 test("with no external_origin a LAN-loaded card has nothing to offer", async () => {
