@@ -1,5 +1,5 @@
 /* Connection Test card for Home Assistant. */
-const CARD_VERSION = "0.1.0"; // x-release-please-version
+const CARD_VERSION = "0.2.0"; // x-release-please-version
 
 const CARD_TAG = "connection-test-card";
 const DOMAIN = "connection_test";
