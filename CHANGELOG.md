@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/johnbr/ha-connection-test/compare/v0.2.0...v0.2.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* record the calling user, and get ready for the HACS default store ([#6](https://github.com/johnbr/ha-connection-test/issues/6)) ([246548d](https://github.com/johnbr/ha-connection-test/commit/246548d8f3ca861fd1db1556687e7b5697504a04))
+
 ## [0.2.0](https://github.com/johnbr/ha-connection-test/compare/v0.1.0...v0.2.0) (2026-09-03)
 
 
