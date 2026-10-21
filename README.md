@@ -1,6 +1,5 @@
 # Connection Test
 
-[![HACS Custom](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://hacs.xyz)
 [![Hassfest](https://github.com/johnbr/ha-connection-test/actions/workflows/hassfest.yml/badge.svg)](https://github.com/johnbr/ha-connection-test/actions/workflows/hassfest.yml)
 [![HACS validation](https://github.com/johnbr/ha-connection-test/actions/workflows/validate.yml/badge.svg)](https://github.com/johnbr/ha-connection-test/actions/workflows/validate.yml)
 
@@ -30,10 +29,15 @@ test run over it could kick the dashboard offline mid-measurement.
 
 ## Install
 
-**HACS** → Integrations → ⋮ → Custom repositories → add
-`https://github.com/johnbr/ha-connection-test` as an **Integration** → install →
-**restart Home Assistant** → _Settings → Devices & Services → Add Integration →
-Connection Test_.
+[![Open this repository in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=johnbr&repository=ha-connection-test&category=integration)
+
+1. In HACS, search for **Connection Test**, download it (or use the button above), and
+   **restart Home Assistant**.
+2. _Settings → Devices & Services → Add Integration → Connection Test_.
+
+If HACS doesn't list it yet, add it as a custom repository instead: HACS → **⋮** →
+**Custom repositories** → `https://github.com/johnbr/ha-connection-test`, category
+**Integration**, then continue from step 1.
 
 **Manually**: copy `custom_components/connection_test/` into your `config/custom_components/`,
 restart, then add the integration.
@@ -179,8 +183,12 @@ Each run also records a connection type — `local_wifi`, `local_wired`, `local`
 
 |                                              | Where it comes from             | How reliable                                                             |
 | -------------------------------------------- | ------------------------------- | ------------------------------------------------------------------------ |
-| **Scope** — did the traffic stay on the LAN? | The address the server observed | A fact                                                                   |
+| **Scope** — did the traffic stay on the LAN? | The address the server observed | A fact, as far as the card relays it honestly — see below               |
 | **Medium** — Wi-Fi, cellular, wired          | `navigator.connection.type`     | Chromium on Android only; absent on desktop Chromium, Safari and Firefox |
+
+The server hands that address to the card from `/api/connection_test/info`, and
+the card sends it back with its result. A report made by hand can therefore claim
+any address; that is fine for a diagnostic label, which is all it is.
 
 So `local_wifi` is "on the LAN, over Wi-Fi", plain `wifi` is "over Wi-Fi, but
 the traffic left the building", and the bare `local` / `remote` are what is left
@@ -221,7 +229,10 @@ the LAN path.
 > *history*: the recorder sees one mixed series.
 
 The card reports results through the `connection_test.report` service, so a run
-can also be recorded from a script or by hand from Developer Tools.
+can also be recorded from a script or by hand from Developer Tools. The `user`
+recorded with a run is the Home Assistant user who made that call; the `user`
+field in the payload is only used when there is none, as in a script or
+automation.
 
 ## Endpoints
 

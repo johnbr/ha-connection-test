@@ -56,9 +56,9 @@ class ConnectionTestRuntime:
         self.last = last if isinstance(last, dict) else None
         self.clients = clients if isinstance(clients, dict) else {}
 
-    async def async_record(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def async_record(self, payload: dict[str, Any], *, caller: str | None = None) -> dict[str, Any]:
         """Normalise one reported run, publish it, and persist it."""
-        entry = normalise_report(payload, timestamp=dt_util.utcnow().isoformat())
+        entry = normalise_report(payload, timestamp=dt_util.utcnow().isoformat(), caller=caller)
         self.last = entry
         self.clients = merge_clients(self.clients, entry)
 

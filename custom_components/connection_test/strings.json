@@ -57,7 +57,7 @@
         },
         "user": {
           "name": "User",
-          "description": "The Home Assistant user logged in on that client."
+          "description": "The Home Assistant user logged in on that client. Only used when the call has no logged-in user behind it (a script or automation); otherwise the caller's own name is recorded."
         },
         "user_agent": {
           "name": "User agent",
