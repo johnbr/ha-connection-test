@@ -27,13 +27,13 @@ sensors publish the most recent run.
 
 from __future__ import annotations
 
-import logging
 import os
 
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.loader import async_get_integration
@@ -53,8 +53,6 @@ from .views import (
     ConnectionTestInfoView,
     ConnectionTestUploadView,
 )
-
-_LOGGER = logging.getLogger(__name__)
 
 # Configured through the UI only.
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -111,8 +109,14 @@ REPORT_SCHEMA = vol.Schema(
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the shared data bucket."""
+    """Set up the shared data bucket and the report service.
+
+    The service is registered here rather than per entry so that it exists
+    for the life of the process: a call made while the entry is unloaded gets
+    a clear error instead of an unknown-service one.
+    """
     hass.data.setdefault(DOMAIN, {})
+    hass.services.async_register(DOMAIN, SERVICE_REPORT, _async_handle_report, schema=REPORT_SCHEMA)
     return True
 
 
@@ -140,9 +144,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # never register a second copy anyway.
         data[DATA_VIEWS_REGISTERED] = True
 
-    if not hass.services.has_service(DOMAIN, SERVICE_REPORT):
-        hass.services.async_register(DOMAIN, SERVICE_REPORT, _async_handle_report, schema=REPORT_SCHEMA)
-
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     integration = await async_get_integration(hass, DOMAIN)
@@ -161,8 +162,20 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def _async_handle_report(call: ServiceCall) -> None:
     """Record a run reported by a client."""
     hass = call.hass
-    for stored in hass.data.get(DOMAIN, {}).values():
-        if isinstance(stored, dict) and (runtime := stored.get(DATA_RUNTIME)):
-            await runtime.async_record(dict(call.data))
-            return
-    _LOGGER.warning("connection_test.report called before the integration finished setting up")
+    runtime = next(
+        (
+            stored[DATA_RUNTIME]
+            for stored in hass.data.get(DOMAIN, {}).values()
+            if isinstance(stored, dict) and stored.get(DATA_RUNTIME)
+        ),
+        None,
+    )
+    if runtime is None:
+        raise HomeAssistantError("Connection Test is not set up: add the integration, or wait for it to finish loading")
+
+    # Who made the call, as Home Assistant authenticated it. This, not the
+    # `user` the payload claims, is what gets recorded -- see normalise_report.
+    caller = None
+    if call.context.user_id and (user := await hass.auth.async_get_user(call.context.user_id)):
+        caller = user.name
+    await runtime.async_record(dict(call.data), caller=caller)

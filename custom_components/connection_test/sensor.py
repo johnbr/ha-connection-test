@@ -214,8 +214,10 @@ class ConnectionTestSensor(SensorEntity):
             "device_model": device.get("model"),
             "device_os": device.get("os"),
             "device_browser": device.get("browser"),
-            # The address the SERVER saw, not one the client claimed about
-            # itself -- it is what decides `path`, so it is shown next to it.
+            # The address the server reported to the client from /info, which
+            # the card relays back in its report. It decides `path`, so it is
+            # shown next to it. A report made by hand can set it to anything:
+            # it labels a diagnostic and is never an access-control input.
             "client_ip": network.get("client_ip"),
             "via_cloudflare": network.get("via_cloudflare"),
             "user": run.get("user"),

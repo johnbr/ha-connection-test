@@ -303,12 +303,23 @@ def _network(payload: Mapping[str, Any], connection: str) -> dict[str, Any]:
     }
 
 
-def normalise_report(payload: Mapping[str, Any], *, timestamp: str) -> dict[str, Any]:
+def normalise_report(
+    payload: Mapping[str, Any],
+    *,
+    timestamp: str,
+    caller: str | None = None,
+) -> dict[str, Any]:
     """Turn one ``connection_test.report`` service call into a stored entry.
 
     The service schema has already checked types; this decides meaning --
     which fields are authoritative, what a missing phase looks like, and how
     much free text is allowed through to the recorder.
+
+    ``caller`` is the name of the Home Assistant user who made the service
+    call, resolved by the server from the call's context. When there is one it
+    is recorded as ``user`` and the payload's own ``user`` is ignored: any
+    logged-in user can call the service, and a name the client merely claims
+    would let one user record a run under another's.
     """
     latency = summarise_latency(payload.get("latency_samples_ms") or [])
 
@@ -356,7 +367,7 @@ def normalise_report(payload: Mapping[str, Any], *, timestamp: str) -> dict[str,
         "connection": connection,
         "device": _device(payload),
         "network": _network(payload, connection),
-        "user": _clean_text(payload.get("user"), 64),
+        "user": _clean_text(caller, 64) if caller else _clean_text(payload.get("user"), 64),
         "user_agent": _clean_text(payload.get("user_agent")),
         "latency": latency,
         "http_latency_ms": _finite(payload.get("http_latency_ms")),

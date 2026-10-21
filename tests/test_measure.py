@@ -146,6 +146,23 @@ def test_normalise_report_derives_rather_than_trusts() -> None:
     assert entry["ts"] == "2026-08-20T12:00:00+00:00"
 
 
+def test_normalise_report_records_the_caller_not_the_claimed_user() -> None:
+    """Any logged-in user can call the service, so a claimed name is not proof."""
+    entry = measure.normalise_report(_payload(user="Somebody Else"), timestamp="t", caller="John")
+    assert entry["user"] == "John"
+
+
+def test_normalise_report_keeps_the_claimed_user_without_a_caller() -> None:
+    """A script or automation has no user behind it; the payload is all there is."""
+    entry = measure.normalise_report(_payload(user="John"), timestamp="t", caller=None)
+    assert entry["user"] == "John"
+
+
+def test_normalise_report_bounds_the_caller_name() -> None:
+    entry = measure.normalise_report(_payload(), timestamp="t", caller="x" * 500)
+    assert len(entry["user"]) == 64
+
+
 def test_normalise_report_survives_a_partial_run() -> None:
     """A cancelled run reports what it got; the rest must read as absent."""
     entry = measure.normalise_report(
